@@ -38,42 +38,122 @@ static __global__ void norm_f32(
     }
 }
 
-template <int block_size>
-static __global__ void group_norm_f32(const float * x, float * dst, const int group_size, const int ne_elements, const float eps) {
-    // blockIdx.x: num_groups idx
-    // threadIdx.x: block_size idx
-    const int start =     blockIdx.x*group_size + threadIdx.x;
-    const int end   = min(blockIdx.x*group_size + group_size,  ne_elements);
+// Group norm runs in three kernels so that a large group is spread over many
+// blocks: partial statistics per chunk of a group (Welford, so the variance
+// does not suffer the cancellation of a single sum of squares), a combine per
+// group, and one elementwise pass that normalises and, when fused, applies the
+// per-channel scale and shift and a SiLU. That is three passes over the data
+// where the unfused group norm, scale, shift and SiLU take eleven.
 
-    float tmp = 0.0f; // partial sum for thread in warp
+struct group_norm_stat {
+    float n;
+    float mean;
+    float m2;
+};
+
+static __device__ __forceinline__ group_norm_stat group_norm_merge(const group_norm_stat a, const group_norm_stat b) {
+    const float n = a.n + b.n;
+    if (n == 0.0f) {
+        return a;
+    }
+    const float delta = b.mean - a.mean;
+    const float mean  = a.mean + delta * (b.n / n);
+    const float m2    = a.m2 + b.m2 + delta * delta * (a.n * b.n / n);
+    return { n, mean, m2 };
+}
+
+static __device__ __forceinline__ group_norm_stat group_norm_warp_merge(group_norm_stat s) {
+#pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        group_norm_stat o;
+        o.n    = __shfl_xor_sync(0xffffffff, s.n, offset);
+        o.mean = __shfl_xor_sync(0xffffffff, s.mean, offset);
+        o.m2   = __shfl_xor_sync(0xffffffff, s.m2, offset);
+        s      = group_norm_merge(s, o);
+    }
+    return s;
+}
+
+// One block per (group, chunk): Welford statistics of the chunk.
+static __global__ void group_norm_partial_f32(const float * x, group_norm_stat * partial, const int group_size,
+                                              const int chunk, const int nchunks, const int64_t ne_elements) {
+    const int     group = blockIdx.x / nchunks;
+    const int     c     = blockIdx.x % nchunks;
+    const int64_t base  = (int64_t) group * group_size;
+    const int     begin = c * chunk;
+    // The last group is shorter when the channels do not divide evenly.
+    const int     end   = (int) min((int64_t) min(begin + chunk, group_size), ne_elements - base);
 
     ggml_cuda_pdl_sync();
-    for (int j = start; j < end; j += block_size) {
-        tmp += x[j];
+    group_norm_stat s = { 0.0f, 0.0f, 0.0f };
+    for (int j = begin + threadIdx.x; j < end; j += blockDim.x) {
+        const float v = x[base + j];
+        s.n += 1.0f;
+        const float d = v - s.mean;
+        s.mean += d / s.n;
+        s.m2 += d * (v - s.mean);
     }
+    s = group_norm_warp_merge(s);
 
-    extern __shared__ float s_sum[];
-    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
-
-    const float mean = tmp / group_size;
-    tmp = 0.0f;
-
-    for (int j = start; j < end; j += block_size) {
-        const float xi = x[j] - mean;
-        dst[j] = xi;
-        tmp += xi * xi;
+    __shared__ group_norm_stat warp_stats[32];
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    if (lane == 0) {
+        warp_stats[warp] = s;
     }
-
-    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum + 32);
-
-    const float variance = tmp / group_size;
-    const float scale = rsqrtf(variance + eps);
-    for (int j = start; j < end; j += block_size) {
-        dst[j] *= scale;
+    __syncthreads();
+    if (warp == 0) {
+        const int nwarps = blockDim.x / WARP_SIZE;
+        s = lane < nwarps ? warp_stats[lane] : group_norm_stat{ 0.0f, 0.0f, 0.0f };
+        s = group_norm_warp_merge(s);
+        if (lane == 0) {
+            partial[blockIdx.x] = s;
+        }
     }
 }
 
-template <int block_size, bool do_multiply = false, bool do_add = false>
+// One warp per group: combine the chunks into mean and 1/std.
+static __global__ void group_norm_combine_f32(const group_norm_stat * partial, float2 * mean_rstd, const int nchunks,
+                                              const int ngroups, const float eps) {
+    const int group = blockIdx.x * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
+    const int lane  = threadIdx.x % WARP_SIZE;
+    if (group >= ngroups) {
+        return;
+    }
+    group_norm_stat s = { 0.0f, 0.0f, 0.0f };
+    for (int c = lane; c < nchunks; c += WARP_SIZE) {
+        s = group_norm_merge(s, partial[group * nchunks + c]);
+    }
+    s = group_norm_warp_merge(s);
+    if (lane == 0) {
+        mean_rstd[group] = make_float2(s.mean, rsqrtf(s.m2 / s.n + eps));
+    }
+}
+
+// Elementwise: normalise, then (optionally) scale and shift per channel and
+// apply SiLU.
+template <bool affine, bool silu>
+static __global__ void group_norm_apply_f32(const float * x, float * dst, const float2 * mean_rstd, const float * scale,
+                                            const float * shift, const int64_t n, const int group_size, const int plane,
+                                            const int channels) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const float2 mr = mean_rstd[i / group_size];
+    float        v  = (x[i] - mr.x) * mr.y;
+    if constexpr (affine) {
+        const int c = (int) ((i / plane) % channels);
+        v           = v * scale[c] + shift[c];
+    }
+    if constexpr (silu) {
+        v = v / (1.0f + expf(-v));
+    }
+    dst[i] = v;
+}
+
+// centered: subtract the row mean first, i.e. layer norm rather than RMS norm.
+template <int block_size, bool do_multiply = false, bool do_add = false, bool centered = false>
 static __global__ void rms_norm_f32(const float * x,
                                     float *       dst,
                                     const int     ncols,
@@ -126,30 +206,39 @@ static __global__ void rms_norm_f32(const float * x,
     }
 
     float tmp = 0.0f; // partial sum for thread in warp
+    float tsum = 0.0f;
 
     ggml_cuda_pdl_sync();
     for (int col = tid; col < ncols; col += block_size) {
         const float xi = x[col];
         tmp += xi * xi;
+        if constexpr (centered) {
+            tsum += xi;
+        }
     }
 
     // sum up partial sums
     extern __shared__ float s_sum[];
     tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    if constexpr (centered) {
+        __syncthreads();
+        tsum = block_reduce<block_reduce_method::SUM, block_size>(tsum, s_sum);
+    }
 
-    const float mean = tmp / ncols;
+    const float row_mean = centered ? tsum / ncols : 0.0f;
+    const float mean = tmp / ncols - row_mean * row_mean;
     const float scale = rsqrtf(mean + eps);
 
     for (int col = tid; col < ncols; col += block_size) {
         if constexpr (do_multiply && do_add) {
             const int mul_col = fastmodulo(col, mul_ncols_packed);
             const int add_col = fastmodulo(col, add_ncols_packed);
-            dst[col]          = scale * x[col] * mul[mul_col] + add[add_col];
+            dst[col]          = scale * (x[col] - row_mean) * mul[mul_col] + add[add_col];
         } else if constexpr (do_multiply) {
             const int mul_col = fastmodulo(col, mul_ncols_packed);
-            dst[col]          = scale * x[col] * mul[mul_col];
+            dst[col]          = scale * (x[col] - row_mean) * mul[mul_col];
         } else {
-            dst[col] = scale * x[col];
+            dst[col] = scale * (x[col] - row_mean);
         }
     }
 }
@@ -290,14 +379,36 @@ static void norm_f32_cuda(
     }
 }
 
-static void group_norm_f32_cuda(
-        const float * x, float * dst, const int num_groups, const float eps, const int group_size, const int ne_elements, cudaStream_t stream) {
-    if (group_size < 1024) {
-        const dim3 block_dims(WARP_SIZE, 1, 1);
-        group_norm_f32<WARP_SIZE><<<num_groups, block_dims, 0, stream>>>(x, dst, group_size, ne_elements, eps);
+// Elements of one group each statistics block reads.
+static constexpr int GROUP_NORM_CHUNK = 16384;
+
+static void group_norm_f32_cuda(ggml_backend_cuda_context & ctx, const float * x, float * dst, const int num_groups,
+                                const float eps, const int group_size, const int64_t ne_elements, const float * scale,
+                                const float * shift, const bool silu, const int plane, const int channels) {
+    cudaStream_t stream  = ctx.stream();
+    const int    nchunks = (group_size + GROUP_NORM_CHUNK - 1) / GROUP_NORM_CHUNK;
+
+    ggml_cuda_pool_alloc<group_norm_stat> partial(ctx.pool(), (size_t) num_groups * nchunks);
+    ggml_cuda_pool_alloc<float2>          mean_rstd(ctx.pool(), num_groups);
+
+    group_norm_partial_f32<<<num_groups * nchunks, 256, 0, stream>>>(x, partial.get(), group_size, GROUP_NORM_CHUNK,
+                                                                   nchunks, ne_elements);
+    const int warps_per_block = 8;
+    group_norm_combine_f32<<<(num_groups + warps_per_block - 1) / warps_per_block, warps_per_block * WARP_SIZE, 0,
+                             stream>>>(partial.get(), mean_rstd.get(), nchunks, num_groups, eps);
+
+    const int      threads = 256;
+    const unsigned blocks  = (unsigned) ((ne_elements + threads - 1) / threads);
+    const bool     affine  = scale != nullptr;
+    if (affine && silu) {
+        group_norm_apply_f32<true, true><<<blocks, threads, 0, stream>>>(x, dst, mean_rstd.get(), scale, shift,
+                                                                        ne_elements, group_size, plane, channels);
+    } else if (affine) {
+        group_norm_apply_f32<true, false><<<blocks, threads, 0, stream>>>(x, dst, mean_rstd.get(), scale, shift,
+                                                                         ne_elements, group_size, plane, channels);
     } else {
-        const dim3 block_dims(1024, 1, 1);
-        group_norm_f32<1024><<<num_groups, block_dims, block_dims.x > WARP_SIZE ? 2 * 32 * sizeof(float): 0, stream>>>(x, dst, group_size, ne_elements, eps);
+        group_norm_apply_f32<false, false><<<blocks, threads, 0, stream>>>(x, dst, mean_rstd.get(), nullptr, nullptr,
+                                                                          ne_elements, group_size, plane, channels);
     }
 }
 
@@ -349,8 +460,10 @@ static void rms_norm_mul_f32_cuda(const float *  x,
                                   const uint32_t add_nchannels,
                                   const uint32_t add_nsamples,
                                   const float    eps,
-                                  cudaStream_t   stream) {
+                                  cudaStream_t   stream,
+                                  const bool     centered) {
     const dim3 blocks_num(nrows, nchannels, nsamples);
+    GGML_ASSERT(mul != nullptr || !centered);
     if (mul == nullptr) {
         rms_norm_f32_cuda(x, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, stream);
         return;
@@ -363,7 +476,7 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         if (ncols < 1024) {
             const dim3 block_dims(256, 1, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
-            ggml_cuda_kernel_launch(rms_norm_f32<256, true>, launch_params,
+            ggml_cuda_kernel_launch(centered ? rms_norm_f32<256, true, false, true> : rms_norm_f32<256, true>, launch_params,
                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                 // underlying cudaLaunchKernelEx does not support default params
@@ -371,7 +484,7 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         } else {
             const dim3 block_dims(1024, 1, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
-            ggml_cuda_kernel_launch(rms_norm_f32<1024, true>, launch_params,
+            ggml_cuda_kernel_launch(centered ? rms_norm_f32<1024, true, false, true> : rms_norm_f32<1024, true>, launch_params,
                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                 // underlying cudaLaunchKernelEx does not support default params
@@ -390,7 +503,7 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         if (ncols < 1024) {
             const dim3 block_dims(256, 1, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims,block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
-            ggml_cuda_kernel_launch(rms_norm_f32<256, true, true>, launch_params,
+            ggml_cuda_kernel_launch(centered ? rms_norm_f32<256, true, true, true> : rms_norm_f32<256, true, true>, launch_params,
                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
                 add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
@@ -398,7 +511,7 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         } else {
             const dim3 block_dims(1024, 1, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
-            ggml_cuda_kernel_launch(rms_norm_f32<1024, true, true>, launch_params,
+            ggml_cuda_kernel_launch(centered ? rms_norm_f32<1024, true, true, true> : rms_norm_f32<1024, true, true>, launch_params,
                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
                 add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
@@ -472,7 +585,29 @@ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     GGML_ASSERT(eps >= 0.0f);
 
     int group_size = src0->ne[0] * src0->ne[1] * ((src0->ne[2] + num_groups - 1) / num_groups);
-    group_norm_f32_cuda(src0_d, dst_d, num_groups * src0->ne[3], eps, group_size, ggml_nelements(src0), stream);
+    GGML_UNUSED(stream);
+    group_norm_f32_cuda(ctx, src0_d, dst_d, num_groups * src0->ne[3], eps, group_size, ggml_nelements(src0), nullptr,
+                        nullptr, false, 0, 1);
+}
+
+void ggml_cuda_op_group_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * gn, ggml_tensor * mul,
+                                   ggml_tensor * add, ggml_tensor * silu) {
+    const ggml_tensor * src0 = gn->src[0];
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && ggml_is_contiguous(src0));
+
+    const int num_groups = gn->op_params[0];
+    float     eps;
+    memcpy(&eps, gn->op_params + 1, sizeof(float));
+
+    const ggml_tensor * scale = mul->src[0] == gn ? mul->src[1] : mul->src[0];
+    const ggml_tensor * shift = add->src[0] == mul ? add->src[1] : add->src[0];
+    GGML_ASSERT(scale->type == GGML_TYPE_F32 && shift->type == GGML_TYPE_F32);
+
+    ggml_tensor * out        = silu != nullptr ? silu : add;
+    const int     group_size = src0->ne[0] * src0->ne[1] * ((src0->ne[2] + num_groups - 1) / num_groups);
+    group_norm_f32_cuda(ctx, (const float *) src0->data, (float *) out->data, num_groups * src0->ne[3], eps,
+                        group_size, ggml_nelements(src0), (const float *) scale->data, (const float *) shift->data,
+                        silu != nullptr, (int) (src0->ne[0] * src0->ne[1]), (int) src0->ne[2]);
 }
 
 void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -556,7 +691,7 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
                           mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
                           /*add_s00*/ 0, 0, 0,
                           0, 0, 0, 0,
-                          eps, stream);
+                          eps, stream, dst->op == GGML_OP_NORM);
 }
 
 void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
@@ -644,7 +779,7 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
                           mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
                           /*add_s00*/ add_s01, add_s02, add_s03,
                           add_ncols, add_nrows, add_nchannels, add_nsamples,
-                          eps, stream);
+                          eps, stream, dst->op == GGML_OP_NORM);
 }
 
 void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

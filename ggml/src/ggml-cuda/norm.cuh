@@ -4,6 +4,11 @@ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+// Group norm followed by a per-channel scale and shift, and optionally a SiLU,
+// in three passes over the data. `silu` may be null.
+void ggml_cuda_op_group_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * gn, ggml_tensor * mul,
+                                   ggml_tensor * add, ggml_tensor * silu);
+
 void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor);

@@ -3115,7 +3115,8 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return false;
     }
 
-    if ((ops.size() == 2 || ops.size() == 3) && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
+    if ((ops.size() == 2 || ops.size() == 3) && (ops.begin()[0] == GGML_OP_RMS_NORM || ops.begin()[0] == GGML_OP_NORM) &&
+        ops.begin()[1] == GGML_OP_MUL) {
         const ggml_tensor *rms_norm = cgraph->nodes[node_idx];
         const ggml_tensor *mul      = cgraph->nodes[node_idx+1];
         const ggml_tensor *add      = nullptr;
@@ -3154,6 +3155,35 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             return false;
         }
 
+        return true;
+    }
+
+    // Group norm, a per-channel scale and shift, and optionally a SiLU.
+    if ((ops.size() == 3 || ops.size() == 4) && ops.begin()[0] == GGML_OP_GROUP_NORM && ops.begin()[1] == GGML_OP_MUL &&
+        ops.begin()[2] == GGML_OP_ADD) {
+        const ggml_tensor * gn  = cgraph->nodes[node_idx];
+        const ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * add = cgraph->nodes[node_idx + 2];
+        if (ops.size() == 4) {
+            if (ops.begin()[3] != GGML_OP_UNARY || unary_ops.size() != 1 ||
+                unary_ops.begin()[0] != GGML_UNARY_OP_SILU ||
+                ggml_get_unary_op(cgraph->nodes[node_idx + 3]) != GGML_UNARY_OP_SILU ||
+                cgraph->nodes[node_idx + 3]->type != GGML_TYPE_F32) {
+                return false;
+            }
+        }
+        if (gn->src[0]->type != GGML_TYPE_F32 || !ggml_is_contiguous(gn->src[0]) || mul->type != GGML_TYPE_F32 ||
+            add->type != GGML_TYPE_F32) {
+            return false;
+        }
+        const ggml_tensor * scale = mul->src[0] == gn ? mul->src[1] : mul->src[0];
+        const ggml_tensor * shift = add->src[0] == mul ? add->src[1] : add->src[0];
+        for (const ggml_tensor * t : { scale, shift }) {
+            if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || t->ne[0] != 1 || t->ne[1] != 1 ||
+                t->ne[2] != gn->ne[2] || t->ne[3] != 1) {
+                return false;
+            }
+        }
         return true;
     }
 
@@ -3967,6 +3997,27 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], nullptr);
         return 2;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_GROUP_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
+        ggml_cuda_op_group_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3]);
+        return 3;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_GROUP_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
+        ggml_cuda_op_group_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], nullptr);
+        return 2;
+    }
+
+    // Layer norm followed by a scale and a shift (adaptive normalisation).
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
+        ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        return 2;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL }, {})) {
+        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        return 1;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
