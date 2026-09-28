@@ -346,13 +346,22 @@ static __host__ int get_cols_per_warp(const int cc) {
 
 // ------------------------------------------------------------------------------------------------------------------
 
+// Whether K/V loads are asynchronous. Without grouped heads (ncols2 == 1) the KV
+// length is not padded to the tile, so only the two-stage pipeline, whose loads
+// zero-fill past the end, is used there, and only for wide Q tiles (long
+// sequences attending to themselves) where overlapping loads with compute pays.
+static constexpr __host__ __device__ int ggml_cuda_fattn_mma_nstages_for(const int DKQ, const int DV, const int ncols1, const int ncols2, const int target) {
+    return ncols2 >= 2 || (ncols1 >= 32 && DKQ == DV && target >= 2) ? target : 0;
+}
+
 static __host__ int ggml_cuda_fattn_mma_get_nstages(const int DKQ, const int DV, const int ncols1, const int ncols2, const int cc) {
-    return cp_async_available(cc) && ncols2 >= 2 ? ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1*ncols2, cc) : 0;
+    return cp_async_available(cc) ?
+        ggml_cuda_fattn_mma_nstages_for(DKQ, DV, ncols1, ncols2, ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1*ncols2, cc)) : 0;
 }
 
 static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages(const int DKQ, const int DV, const int ncols1, const int ncols2) {
 #ifdef CP_ASYNC_AVAILABLE
-    return ncols2 >= 2 ? ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1*ncols2) : 0;
+    return ggml_cuda_fattn_mma_nstages_for(DKQ, DV, ncols1, ncols2, ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1*ncols2));
 #else
     GGML_UNUSED_VARS(DKQ, DV, ncols1, ncols2);
     return 0;
@@ -371,7 +380,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
     const int chunks_per_row = D2 / h2_per_chunk;
     if constexpr (use_cp_async) {
         static_assert(warp_size == 32, "bad warp_size");
-        static_assert(!oob_check, "OOB check not compatible with cp_async");
         constexpr int preload = 64;
 
         const unsigned int tile_KV_32 = ggml_cuda_cvta_generic_to_shared(tile_KV);
@@ -398,11 +406,18 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
                 for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
                     const int k = k0 + (stride_k == warp_size ? threadIdx.x : threadIdx.x % stride_k);
 
+                    unsigned int dst;
                     if constexpr (swz) {
-                        const int smem_offs_b = ggml_cuda_fattn_smem_swizzle::bytes_rc<stride_tile>(i, k*h2_per_chunk);
-                        cp_async_cg_16<preload>(tile_KV_32 + smem_offs_b, KV + i*stride_KV + k*h2_per_chunk);
+                        dst = tile_KV_32 + ggml_cuda_fattn_smem_swizzle::bytes_rc<stride_tile>(i, k*h2_per_chunk);
                     } else {
-                        cp_async_cg_16<preload>(tile_KV_32 + i*(stride_tile*sizeof(half2)) + k*16, KV + i*stride_KV + k*h2_per_chunk);
+                        dst = tile_KV_32 + i*(stride_tile*sizeof(half2)) + k*16;
+                    }
+                    if constexpr (oob_check) {
+                        // Rows past the end are zero-filled without being read.
+                        const bool in_bounds = i < i_sup;
+                        cp_async_cg_16_zfill<preload>(dst, KV + (in_bounds ? i*stride_KV + k*h2_per_chunk : 0), in_bounds ? 16 : 0);
+                    } else {
+                        cp_async_cg_16<preload>(dst, KV + i*stride_KV + k*h2_per_chunk);
                     }
                 }
             }
@@ -595,7 +610,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #endif // defined(TURING_MMA_AVAILABLE)
 
     if constexpr (nstages > 1) {
-        static_assert(!oob_check, "OOB check incompatible with multi-stage pipeline");
         static_assert(!V_is_K_view, "K data reuse not implemented multi-stage loading");
         static_assert(nbatch_K2 == DKQ/2, "batching not implemented for multi stage loading");
         constexpr bool use_cp_async = true;
@@ -952,12 +966,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         cp_async_wait_all();
         __syncthreads();
         if (!last_iter) {
+            // With bounds checks k_VKQ_sup counts the KV rows left from this
+            // tile on, so the next tile has k_VKQ_sup - nbatch_fa of them.
+            const int k_VKQ_sup_next = k_VKQ_sup - nbatch_fa;
             if (ncols2 > 1 || mask_h) {
-                flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
-                    (mask_h + k_VKQ_0 + nbatch_fa, tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01);
+                // The mask loader has no zero-filling asynchronous path.
+                flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, !oob_check, oob_check>
+                    (mask_h + k_VKQ_0 + nbatch_fa, tile_mask, stride_mask, k_VKQ_sup_next, jt*ncols1, ne01);
             }
             flash_attn_ext_f16_load_tile<stride_tile_K, swz_K, nwarps, nbatch_fa, use_cp_async, oob_check>
-                (K_h2 + int64_t(k_VKQ_0 + nbatch_fa)*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
+                (K_h2 + int64_t(k_VKQ_0 + nbatch_fa)*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup_next);
         }
     }
 
@@ -1273,11 +1291,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     // Preload mask and K data for first iteration when using cp_async with multiple stages:
     if constexpr (nstages > 1) {
         static_assert(nbatch_K2 == DKQ/2, "batching not implemented for multi-stage pipeline");
+        // Without grouped heads the KV length need not be a multiple of the tile.
         constexpr bool use_cp_async = true;
-        constexpr bool oob_check    = false;
-        constexpr int  k_VKQ_sup    = nbatch_fa;
+        constexpr bool oob_check    = ncols2 == 1;
+        const     int  k_VKQ_sup    = oob_check ? ne11 - kb0*nbatch_fa : nbatch_fa;
         if (ncols2 > 1 || mask_h) {
-            flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
+            flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, !oob_check, oob_check>
                 (mask_h + kb0*nbatch_fa, tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01);
         }
         flash_attn_ext_f16_load_tile<stride_tile_K, swz_K, nwarps, nbatch_fa, use_cp_async, oob_check>
@@ -1289,7 +1308,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         constexpr bool oob_check = true;
         for (; kb0 < kb0_stop-1; ++kb0) {
             constexpr bool last_iter = false;
-            constexpr int  k_VKQ_sup = nbatch_fa;
+            // KV rows left from this tile on; only the tile's own are used, and
+            // a pipelined load of the next tile is bounded by the rest.
+            const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
             flash_attn_ext_f16_iter
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, last_iter, oob_check,
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
