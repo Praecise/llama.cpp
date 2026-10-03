@@ -1,4 +1,5 @@
 #include "out-prod.cuh"
+#include "convert.cuh"
 
 #include <cstdint>
 
@@ -30,7 +31,6 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
@@ -44,17 +44,35 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(ne2 == src1->ne[2]);
     GGML_ASSERT(ne3 == src1->ne[3]);
 
-    const float * src0_d = (const float *) src0->data;
     const float * src1_d = (const float *) src1->data;
     float       *  dst_d = (float       *)  dst->data;
 
     cudaStream_t   stream = ctx.stream();
     cublasHandle_t handle = ctx.cublas_handle();
 
+    // a non-F32 src0 (a frozen F16/BF16 or quantized weight) is converted to a dense F32 copy first,
+    // so the product itself is the same F32 GEMM for every weight type
+    const float * src0_d = (const float *) src0->data;
+    size_t src0_nb1 = nb01;
+    size_t src0_nb2 = nb02;
+    size_t src0_nb3 = nb03;
+    ggml_cuda_pool_alloc<float> src0_f32(ctx.pool());
+    if (src0->type != GGML_TYPE_F32) {
+        GGML_ASSERT(ggml_is_contiguous(src0));
+        const to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(src0->type);
+        GGML_ASSERT(to_fp32 != nullptr);
+        src0_f32.alloc(ggml_nelements(src0));
+        to_fp32(src0->data, src0_f32.get(), ggml_nelements(src0), stream);
+        src0_d   = src0_f32.get();
+        src0_nb1 = ne00*sizeof(float);
+        src0_nb2 = ne01*src0_nb1;
+        src0_nb3 = ne02*src0_nb2;
+    }
+
     const float alpha = 1.0f;
     const float beta = 0.0f;
 
-    const int64_t lda = nb01 / sizeof(float);
+    const int64_t lda = src0_nb1 / sizeof(float);
     const int64_t ldc = nb1  / sizeof(float);
 
     const bool src1_T = ggml_is_transposed(src1);
@@ -63,8 +81,8 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(                             (src1_T ?        nb11 :        nb10) == sizeof(float));
 
     // data strides in dimensions 2/3
-    const size_t s02 = nb02 / sizeof(float);
-    const size_t s03 = nb03 / sizeof(float);
+    const size_t s02 = src0_nb2 / sizeof(float);
+    const size_t s03 = src0_nb3 / sizeof(float);
     const size_t s12 = nb12 / sizeof(float);
     const size_t s13 = nb13 / sizeof(float);
     const size_t s2  = nb2  / sizeof(float);
