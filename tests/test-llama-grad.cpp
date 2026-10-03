@@ -34,29 +34,59 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
     const bool norm = strstr(tensor->name, "norm") != nullptr;
     std::normal_distribution<float> dis(norm ? 1.0f : 0.0f, norm ? 0.1f : 0.2f);
 
-    GGML_ASSERT(tensor->type == GGML_TYPE_F32);
     std::vector<float> tmp(ggml_nelements(tensor));
     for (float & x : tmp) {
         x = dis(gen);
     }
-    ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
+    if (tensor->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
+        return;
+    }
+    std::vector<uint8_t> q(ggml_nbytes(tensor));
+    ggml_quantize_chunk(tensor->type, tmp.data(), q.data(), 0, ggml_nrows(tensor), tensor->ne[0], nullptr);
+    ggml_backend_tensor_set(tensor, q.data(), 0, q.size());
 }
 
-static gguf_context_ptr model_metadata() {
+static const char * LOW_PRECISION_WEIGHTS[] = {"attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_up", "ffn_down"};
+
+static bool is_low_precision_weight(const char * name) {
+    for (uint32_t il = 0; il < N_LAYER; ++il) {
+        for (const char * w : LOW_PRECISION_WEIGHTS) {
+            if (std::string(name) == "blk." + std::to_string(il) + "." + w + ".weight") {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// a dense model; with wtype other than F32 the attention and MLP weights are stored in that type
+static gguf_context_ptr model_metadata(uint32_t n_embd = N_EMBD, uint32_t n_ff = N_FF, ggml_type wtype = GGML_TYPE_F32) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(LLM_ARCH_LLAMA, ret.get());
     ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE,         llm_arch_name(LLM_ARCH_LLAMA));
     ms.add_kv(LLM_KV_VOCAB_SIZE,                   N_VOCAB);
     ms.add_kv(LLM_KV_CONTEXT_LENGTH,               N_CTX);
-    ms.add_kv(LLM_KV_EMBEDDING_LENGTH,             N_EMBD);
+    ms.add_kv(LLM_KV_EMBEDDING_LENGTH,             n_embd);
     ms.add_kv(LLM_KV_BLOCK_COUNT,                  N_LAYER);
-    ms.add_kv(LLM_KV_FEED_FORWARD_LENGTH,          N_FF);
+    ms.add_kv(LLM_KV_FEED_FORWARD_LENGTH,          n_ff);
     ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT,         N_HEAD);
     ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV,      uint32_t(1)); // grouped-query heads
     ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,  1e-5f);
-    ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,         N_EMBD/N_HEAD);
+    ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,         n_embd/N_HEAD);
     ms.add_kv(LLM_KV_ROPE_FREQ_BASE,               10000.0f);
     ms.add_kv(LLM_KV_TOKENIZER_MODEL,              "no_vocab");
+    if (wtype != GGML_TYPE_F32) {
+        for (uint32_t il = 0; il < N_LAYER; ++il) {
+            for (const char * w : LOW_PRECISION_WEIGHTS) {
+                ggml_tensor t;
+                memset(&t, 0, sizeof(t));
+                t.type = wtype;
+                ggml_format_name(&t, "blk.%u.%s.weight", il, w);
+                gguf_add_tensor(ret.get(), &t);
+            }
+        }
+    }
     return ret;
 }
 
@@ -220,6 +250,87 @@ static void test_fd(llama_model * model, bool flash_attn) {
     check(llama_opt_grad_sequence(lctx.get(), tokens.data(), N_CTX + 1, targets.data(), nullptr) == -2, "sequence longer than the ubatch refused");
 }
 
+// values of a tensor that test_quantized stores as `rt_type`, rounded through that type and back
+static void set_tensor_data_rounded(struct ggml_tensor * tensor, void * userdata) {
+    const auto * ud = (const std::pair<size_t, ggml_type> *) userdata;
+    size_t seed = ud->first;
+    if (ud->second == GGML_TYPE_F32 || !is_low_precision_weight(tensor->name)) {
+        set_tensor_data(tensor, &seed);
+        return;
+    }
+    // generate exactly as set_tensor_data would for the stored type, then round-trip
+    ggml_tensor tmp = *tensor;
+    tmp.type = ud->second;
+    tmp.nb[0] = ggml_type_size(tmp.type);
+    tmp.nb[1] = ggml_row_size(tmp.type, tmp.ne[0]);
+    seed ^= std::hash<std::string>{}(tensor->name);
+    std::mt19937 gen(seed);
+    std::normal_distribution<float> dis(0.0f, 0.2f);
+    std::vector<float> x(ggml_nelements(tensor));
+    for (float & v : x) {
+        v = dis(gen);
+    }
+    std::vector<uint8_t> q(ggml_row_size(tmp.type, tmp.ne[0])*ggml_nrows(tensor));
+    ggml_quantize_chunk(tmp.type, x.data(), q.data(), 0, ggml_nrows(tensor), tensor->ne[0], nullptr);
+    ggml_get_type_traits(tmp.type)->to_float(q.data(), x.data(), ggml_nelements(tensor));
+    ggml_backend_tensor_set(tensor, x.data(), 0, ggml_nbytes(tensor));
+}
+
+static bool select_norms_and_output(const struct ggml_tensor * tensor, void * userdata) {
+    GGML_UNUSED(userdata);
+    return strstr(tensor->name, "norm") != nullptr || strcmp(tensor->name, "output.weight") == 0;
+}
+
+// gradients through frozen low-precision weights (dX = W^T dY with W in BF16 or a quantized type)
+// match the gradients of an F32 model holding the same rounded weights; the only difference left
+// is the rounding of activations in the low-precision forward matmuls
+static void test_quantized(ggml_type wtype, uint32_t n_embd, uint32_t n_ff, double tol) {
+    printf("frozen %s weights\n", ggml_type_name(wtype));
+    const int n_tokens = 10;
+    std::vector<llama_token> tokens(n_tokens);
+    std::vector<float> targets((size_t) n_tokens*N_VOCAB, 0.0f);
+    for (int i = 0; i < n_tokens; ++i) {
+        tokens[i] = (i*5 + 2) % N_VOCAB;
+        targets[(size_t) i*N_VOCAB + (i*3 + 1) % N_VOCAB] = 1.0f;
+    }
+    const char * names[] = {"blk.0.attn_norm.weight", "blk.0.ffn_norm.weight", "blk.1.attn_norm.weight", "output_norm.weight"};
+
+    std::vector<std::vector<float>> grads[2];
+    for (int ref = 0; ref < 2; ++ref) {
+        gguf_context_ptr meta = model_metadata(n_embd, n_ff, ref ? GGML_TYPE_F32 : wtype);
+        std::pair<size_t, ggml_type> ud = {77, ref ? wtype : GGML_TYPE_F32};
+        llama_model_params mp = llama_model_default_params();
+        ggml_backend_dev_t devs[] = {ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), nullptr};
+        mp.devices = devs;
+        llama_model_ptr model(llama_model_init_from_user(meta.get(), set_tensor_data_rounded, &ud, mp));
+        GGML_ASSERT(model);
+        GGML_ASSERT(llama_model_get_tensor(model.get(), "blk.0.attn_q.weight")->type == (ref ? GGML_TYPE_F32 : wtype));
+
+        llama_context_ptr lctx = make_ctx(model.get(), false, GGML_TYPE_F32, 4);
+        GGML_ASSERT(llama_opt_grad_init(lctx.get(), model.get(), select_norms_and_output, nullptr) == 0);
+        if (llama_opt_grad_sequence(lctx.get(), tokens.data(), n_tokens, targets.data(), nullptr) != 0) {
+            check(false, "backward pass");
+            return;
+        }
+        for (const char * name : names) {
+            grads[ref].push_back(read_f32(llama_opt_grad(lctx.get(), llama_model_get_tensor(model.get(), name))));
+        }
+    }
+    for (size_t k = 0; k < std::size(names); ++k) {
+        double num = 0.0;
+        double den = 0.0;
+        for (size_t i = 0; i < grads[0][k].size(); ++i) {
+            const double d = grads[0][k][i] - grads[1][k][i];
+            num += d*d;
+            den += (double) grads[1][k][i]*grads[1][k][i];
+        }
+        const double rel = std::sqrt(num / std::max(den, 1e-30));
+        char what[128];
+        snprintf(what, sizeof(what), "%s (|g| %.2e, rel err %.1e)", names[k], std::sqrt(den), rel);
+        check(den > 1e-12 && rel <= tol, what);
+    }
+}
+
 static void test_repeatable(llama_model * model) {
     printf("repeatability across thread counts\n");
     const int n_tokens = 16;
@@ -282,6 +393,10 @@ int main(void) {
     test_fd(model.get(), false);
     test_fd(model.get(), true);
     test_repeatable(model.get());
+    test_quantized(GGML_TYPE_BF16, N_EMBD, N_FF, 2e-2);
+    test_quantized(GGML_TYPE_Q8_0, N_EMBD, 64, 2e-2);
+    test_quantized(GGML_TYPE_Q4_0, N_EMBD, 64, 2e-2);
+    test_quantized(GGML_TYPE_Q4_K, 256, 256, 2e-2);
 
     llama_backend_free();
     printf("%s\n", n_fail == 0 ? "PASSED" : "FAILED");

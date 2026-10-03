@@ -10097,6 +10097,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // BF16 weights: the backward-data matmul of a frozen BF16 weight
+    for (int n : {1, 16}) {
+        for (int bs2 : {1, 3}) {
+            test_cases.emplace_back(new test_out_prod(GGML_TYPE_BF16, GGML_TYPE_F32, 256, n, 16, {bs2, 1}, {1, 1}));
+        }
+    }
+
     // ne2 sweep to cover the cublasSgemmStridedBatched path (dps2 == 1, ne2 > 1)
     for (int64_t ne2 : {1, 8, 16, 32}) {
         test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32,

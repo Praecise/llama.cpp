@@ -4541,6 +4541,7 @@ void ggml_compute_forward_out_prod(
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_BF16: // rows converted with the type's to_float, as for quantized types
             {
                 ggml_compute_forward_out_prod_q_f32(params, dst);
             } break;
