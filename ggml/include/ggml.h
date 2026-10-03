@@ -2832,6 +2832,10 @@ extern "C" {
     // (for example split GLU variants only); lets a caller refuse a graph instead of aborting
     GGML_API bool ggml_backward_supported(const struct ggml_tensor * tensor);
 
+    // the first node of a forward graph that needs a gradient (it depends on a parameter) but
+    // cannot be differentiated, or NULL when ggml_build_backward_expand can handle the graph
+    GGML_API struct ggml_tensor * ggml_graph_backward_unsupported(struct ggml_cgraph * cgraph);
+
     // graph allocation in a context
     GGML_API struct ggml_cgraph * ggml_new_graph       (struct ggml_context * ctx); // size = GGML_DEFAULT_GRAPH_SIZE, grads = false
     GGML_API struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t size, bool grads);

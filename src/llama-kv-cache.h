@@ -180,6 +180,10 @@ public:
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
 
+    // with value true, get_k and get_v read through the row writes of the ubatch being built, so a
+    // backward pass reaches the K and V projections; refused (returns false) unless K and V are F32
+    bool set_differentiable(bool value);
+
     //
     // preparation API
     //
@@ -244,6 +248,11 @@ private:
     };
 
     bool v_trans = true;  // the value tensor is transposed
+
+    // differentiable reads: the row writes of the current ubatch per cache layer, cleared by apply_ubatch
+    bool differentiable = false;
+    mutable std::vector<ggml_tensor *> k_written;
+    mutable std::vector<ggml_tensor *> v_written;
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;

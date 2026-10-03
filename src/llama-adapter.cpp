@@ -446,6 +446,27 @@ int32_t llama_adapter_meta_val_str(const llama_adapter_lora * adapter, const cha
     return snprintf(buf, buf_size, "%s", it->second.c_str());
 }
 
+int32_t llama_adapter_lora_n_tensors(const llama_adapter_lora * adapter) {
+    int32_t n = 0;
+    for (const auto & ctx : adapter->ctxs) {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t; t = ggml_get_next_tensor(ctx.get(), t)) {
+            n++;
+        }
+    }
+    return n;
+}
+
+ggml_tensor * llama_adapter_lora_get_tensor(llama_adapter_lora * adapter, int32_t i) {
+    for (const auto & ctx : adapter->ctxs) {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t; t = ggml_get_next_tensor(ctx.get(), t)) {
+            if (i-- == 0) {
+                return t;
+            }
+        }
+    }
+    return nullptr;
+}
+
 int32_t llama_adapter_meta_count(const llama_adapter_lora * adapter) {
     return (int)adapter->gguf_kv.size();
 }

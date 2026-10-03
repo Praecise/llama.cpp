@@ -1094,6 +1094,11 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 }
 
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
+    if (differentiable) {
+        std::fill(k_written.begin(), k_written.end(), nullptr);
+        std::fill(v_written.begin(), v_written.end(), nullptr);
+    }
+
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -1268,7 +1273,7 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
-    return ggml_view_4d(ctx, k,
+    return ggml_view_4d(ctx, differentiable && k_written[ikv] ? k_written[ikv] : k,
             hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
             ggml_row_size(k->type, hparams.n_embd_head_k(il)),
             ggml_row_size(k->type, n_embd_k_gqa),
@@ -1289,9 +1294,11 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
+    ggml_tensor * v_src = differentiable && v_written[ikv] ? v_written[ikv] : v;
+
     if (!v_trans) {
         // note: v->nb[1] <= v->nb[2]
-        return ggml_view_4d(ctx, v,
+        return ggml_view_4d(ctx, v_src,
                 hparams.n_embd_head_v(il), hparams.n_head_kv(il), n_kv, ns,
                 ggml_row_size(v->type, hparams.n_embd_head_v(il)),          // v->nb[1]
                 ggml_row_size(v->type, n_embd_v_gqa),                   // v->nb[2]
@@ -1300,7 +1307,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     }
 
     // note: v->nb[1] > v->nb[2]
-    return ggml_view_4d(ctx, v,
+    return ggml_view_4d(ctx, v_src,
             n_kv, hparams.n_head_kv(il), hparams.n_embd_head_v(il), ns,
             ggml_row_size(v->type, kv_size*hparams.n_embd_head_v(il)),  // v->nb[1]
             ggml_row_size(v->type, kv_size),                        // v->nb[2]
@@ -1340,7 +1347,11 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     }
 
     // store the current K values into the cache
-    return ggml_set_rows(ctx, k, k_cur, k_idxs);
+    ggml_tensor * written = ggml_set_rows(ctx, k, k_cur, k_idxs);
+    if (differentiable) {
+        k_written[ikv] = written;
+    }
+    return written;
 }
 
 ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
@@ -1375,7 +1386,11 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
             v = ggml_reshape_2d(ctx, v, n_embd_gqa, kv_size*n_stream);
         }
 
-        return ggml_set_rows(ctx, v, v_cur, v_idxs);
+        ggml_tensor * written = ggml_set_rows(ctx, v, v_cur, v_idxs);
+        if (differentiable) {
+            v_written[ikv] = written;
+        }
+        return written;
     }
 
     if (ggml_row_size(v_cur->type, n_embd_gqa) == v_cur->nb[2]) {
@@ -1396,13 +1411,45 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
 
     v_cur = ggml_reshape_2d(ctx, v_cur, 1, ggml_nelements(v_cur));
 
-    return ggml_set_rows(ctx, v_view, v_cur, v_idxs);
+    ggml_tensor * written = ggml_set_rows(ctx, v_view, v_cur, v_idxs);
+    if (differentiable) {
+        v_written[ikv] = written;
+    }
+    return written;
+}
+
+bool llama_kv_cache::set_differentiable(bool value) {
+    if (value) {
+        for (const auto & layer : layers) {
+            if ((layer.k && layer.k->type != GGML_TYPE_F32) || (layer.v && layer.v->type != GGML_TYPE_F32)) {
+                return false;
+            }
+        }
+    }
+    differentiable = value;
+    k_written.assign(layers.size(), nullptr);
+    v_written.assign(layers.size(), nullptr);
+    return true;
+}
+
+// writes row indices into an I64 or I32 index tensor
+static auto llama_kv_idx_setter(ggml_tensor * dst) {
+    GGML_ASSERT(dst->type == GGML_TYPE_I64 || dst->type == GGML_TYPE_I32);
+    return [dst](size_t i, int64_t idx) {
+        if (dst->type == GGML_TYPE_I64) {
+            ((int64_t *) dst->data)[i] = idx;
+        } else {
+            GGML_ASSERT(idx <= INT32_MAX);
+            ((int32_t *) dst->data)[i] = (int32_t) idx;
+        }
+    };
 }
 
 ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
     const uint32_t n_tokens = ubatch.n_tokens;
 
-    ggml_tensor * k_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
+    // the backward of a row write gathers with I32 indices
+    ggml_tensor * k_idxs = ggml_new_tensor_1d(ctx, differentiable ? GGML_TYPE_I32 : GGML_TYPE_I64, n_tokens);
 
     ggml_set_input(k_idxs);
 
@@ -1415,9 +1462,9 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
     ggml_tensor * v_idxs;
 
     if (!v_trans) {
-        v_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
+        v_idxs = ggml_new_tensor_1d(ctx, differentiable ? GGML_TYPE_I32 : GGML_TYPE_I64, n_tokens);
     } else {
-        v_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens*hparams.n_embd_v_gqa_max());
+        v_idxs = ggml_new_tensor_1d(ctx, differentiable ? GGML_TYPE_I32 : GGML_TYPE_I64, n_tokens*hparams.n_embd_v_gqa_max());
     }
 
     ggml_set_input(v_idxs);
@@ -1471,13 +1518,13 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
     GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-    int64_t * data = (int64_t *) dst->data;
+    auto set = llama_kv_idx_setter(dst);
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const int64_t offs = sinfo.strm[s]*get_size();
 
         for (uint32_t i = 0; i < sinfo.size(); ++i) {
-            data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
+            set(s*sinfo.size() + i, offs + sinfo.idxs[s][i]);
         }
     }
 }
@@ -1487,14 +1534,14 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
     GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-    int64_t * data = (int64_t *) dst->data;
+    auto set = llama_kv_idx_setter(dst);
 
     if (!v_trans) {
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
             const int64_t offs = sinfo.strm[s]*get_size();
 
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
-                data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
+                set(s*sinfo.size() + i, offs + sinfo.idxs[s][i]);
             }
         }
     } else {
@@ -1508,7 +1555,7 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
 
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
                 for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
-                    data[s*sinfo.size()*n_embd_v_gqa + i*n_embd_v_gqa + j] = offs + j*kv_size + sinfo.idxs[s][i];
+                    set(s*sinfo.size()*n_embd_v_gqa + i*n_embd_v_gqa + j, offs + j*kv_size + sinfo.idxs[s][i]);
                 }
             }
         }

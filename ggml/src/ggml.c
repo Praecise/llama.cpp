@@ -7764,6 +7764,41 @@ void ggml_build_forward_order(struct ggml_cgraph * cgraph, struct ggml_tensor * 
     ggml_build_forward_impl(cgraph, tensor, true, false);
 }
 
+// sources of `node` whose gradient has no effect on the gradient of its output
+static void ggml_backward_ignored_srcs(const struct ggml_tensor * node, bool ignore_src[GGML_MAX_SRC]) {
+    switch (node->op) {
+        // gradients in node->src[0] for one reason or another have no effect on output gradients
+        case GGML_OP_IM2COL:      // only used for its shape
+        case GGML_OP_IM2COL_BACK: // same as IM2COL
+            ignore_src[0] = true;
+            break;
+        case GGML_OP_UNARY: {
+            const enum ggml_unary_op uop = ggml_get_unary_op(node);
+            // SGN and STEP unary ops are piecewise constant
+            if (uop == GGML_UNARY_OP_SGN || uop == GGML_UNARY_OP_STEP) {
+                ignore_src[0] = true;
+            }
+        } break;
+
+        // gradients in node->src[1] for one reason or another have no effect on output gradients
+        case GGML_OP_CPY:           // gradients in CPY target are irrelevant
+        case GGML_OP_GET_ROWS:      // row indices not differentiable
+        case GGML_OP_GET_ROWS_BACK: // same as for GET_ROWS
+        case GGML_OP_ROPE:          // positions not differentiable
+            ignore_src[1] = true;
+            break;
+
+        // row indices and the destination of a row write have no effect on the written rows' gradient
+        case GGML_OP_SET_ROWS:
+            ignore_src[1] = true;
+            ignore_src[2] = true;
+            break;
+
+        default:
+            break;
+    }
+}
+
 void ggml_build_backward_expand(
         struct ggml_context *  ctx,
         struct ggml_cgraph  *  cgraph,
@@ -7799,37 +7834,7 @@ void ggml_build_backward_expand(
 
         bool node_needs_grad = (node->flags & GGML_TENSOR_FLAG_PARAM) || (node->flags & GGML_TENSOR_FLAG_LOSS);
         bool ignore_src[GGML_MAX_SRC] = {false};
-        switch (node->op) {
-            // gradients in node->src[0] for one reason or another have no effect on output gradients
-            case GGML_OP_IM2COL:      // only used for its shape
-            case GGML_OP_IM2COL_BACK: // same as IM2COL
-                ignore_src[0] = true;
-                break;
-            case GGML_OP_UNARY: {
-                const enum ggml_unary_op uop = ggml_get_unary_op(node);
-                // SGN and STEP unary ops are piecewise constant
-                if (uop == GGML_UNARY_OP_SGN || uop == GGML_UNARY_OP_STEP) {
-                    ignore_src[0] = true;
-                }
-            } break;
-
-            // gradients in node->src[1] for one reason or another have no effect on output gradients
-            case GGML_OP_CPY:           // gradients in CPY target are irrelevant
-            case GGML_OP_GET_ROWS:      // row indices not differentiable
-            case GGML_OP_GET_ROWS_BACK: // same as for GET_ROWS
-            case GGML_OP_ROPE:          // positions not differentiable
-                ignore_src[1] = true;
-                break;
-
-            // row indices and the destination of a row write have no effect on the written rows' gradient
-            case GGML_OP_SET_ROWS:
-                ignore_src[1] = true;
-                ignore_src[2] = true;
-                break;
-
-            default:
-                break;
-        }
+        ggml_backward_ignored_srcs(node, ignore_src);
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
             if (!node->src[j] || ignore_src[j] || !grads_needed[ggml_hash_find(&cgraph->visited_hash_set, node->src[j])]) {
                 continue;
@@ -7868,6 +7873,43 @@ void ggml_build_backward_expand(
     }
 
     free(grads_needed);
+}
+
+struct ggml_tensor * ggml_graph_backward_unsupported(struct ggml_cgraph * cgraph) {
+    bool * needed = calloc(cgraph->visited_hash_set.size, sizeof(bool));
+    GGML_ASSERT(needed);
+
+    struct ggml_tensor * unsupported = NULL;
+    for (int i = 0; i < cgraph->n_nodes && !unsupported; ++i) {
+        struct ggml_tensor * node = cgraph->nodes[i];
+        if (node->type == GGML_TYPE_I32) {
+            continue;
+        }
+
+        bool node_needs_grad = (node->flags & GGML_TENSOR_FLAG_PARAM) || (node->flags & GGML_TENSOR_FLAG_LOSS);
+        bool ignore_src[GGML_MAX_SRC] = {false};
+        ggml_backward_ignored_srcs(node, ignore_src);
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (!node->src[j] || ignore_src[j] || !needed[ggml_hash_find(&cgraph->visited_hash_set, node->src[j])]) {
+                continue;
+            }
+            if (node->src[j]->type != GGML_TYPE_F32 && node->src[j]->type != GGML_TYPE_F16) {
+                unsupported = node;
+            }
+            node_needs_grad = true;
+            break;
+        }
+        if (!node_needs_grad) {
+            continue;
+        }
+        if (!ggml_backward_supported(node)) {
+            unsupported = node;
+        }
+        needed[ggml_hash_find(&cgraph->visited_hash_set, node)] = true;
+    }
+
+    free(needed);
+    return unsupported;
 }
 
 static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
