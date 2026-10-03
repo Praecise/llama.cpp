@@ -1639,19 +1639,26 @@ extern "C" {
     // The KV cache, when present, must be F32 and is written through a differentiable path.
     //
 
+    // loss_type is GGML_OPT_LOSS_TYPE_CROSS_ENTROPY (targets are distributions over the vocabulary)
+    // or GGML_OPT_LOSS_TYPE_WEIGHTED_SUM (targets are the gradient of the caller's objective with
+    // respect to the logits, for objectives computed outside the graph)
     // returns 0 on success, -1 if the context already trains, -2 if its memory has no
-    // differentiable path, -3 if the KV cache is not F32, -4 if no parameter is selected
+    // differentiable path, -3 if the KV cache is not F32, -4 if no parameter is selected,
+    // -5 for another loss type
     LLAMA_API int32_t llama_opt_grad_init(
             struct llama_context  * lctx,
             struct llama_model    * model,
+            enum ggml_opt_loss_type loss_type,
             llama_opt_param_filter  param_filter,
             void                  * param_filter_ud);
 
     // One sequence at positions 0..n_tokens-1 from an empty memory, in a single ubatch.
     // logits_out (n_tokens x n_vocab floats, may be NULL) receives the forward logits.
-    // With targets (n_tokens x n_vocab floats) the pass also runs backward and adds
-    // d/dlogits [ -sum_rows sum(targets * log_softmax(logits)) / n_tokens ] to the parameter gradients,
-    // that is (softmax(logits) - targets)/n_tokens per row when each target row sums to one.
+    // With targets (n_tokens x n_vocab floats) the pass also runs backward and adds to the
+    // parameter gradients the gradient of
+    //   cross entropy: -sum_rows sum(targets * log_softmax(logits)) / n_tokens, whose gradient with
+    //                  respect to a row is (softmax(row) * sum(target row) - target row) / n_tokens
+    //   weighted sum:  sum(targets * logits), whose gradient with respect to the logits is targets
     // returns 0 on success, -1 without llama_opt_grad_init, -2 if n_tokens exceeds the ubatch,
     // -3 if the graph needs a gradient through an op without a backward (logged by name)
     LLAMA_API int32_t llama_opt_grad_sequence(

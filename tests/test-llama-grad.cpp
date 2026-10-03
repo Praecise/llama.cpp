@@ -149,8 +149,8 @@ static void test_fd(llama_model * model, bool flash_attn) {
     printf("finite differences, flash attention %s\n", flash_attn ? "on" : "off");
     llama_context_ptr lctx = make_ctx(model, flash_attn, GGML_TYPE_F32, 4);
     GGML_ASSERT(lctx);
-    check(llama_opt_grad_init(lctx.get(), model, select_all, nullptr) == 0, "init");
-    check(llama_opt_grad_init(lctx.get(), model, select_all, nullptr) == -1, "second init refused");
+    check(llama_opt_grad_init(lctx.get(), model, GGML_OPT_LOSS_TYPE_CROSS_ENTROPY, select_all, nullptr) == 0, "init");
+    check(llama_opt_grad_init(lctx.get(), model, GGML_OPT_LOSS_TYPE_CROSS_ENTROPY, select_all, nullptr) == -1, "second init refused");
 
     const int n_tokens = 12;
     std::mt19937 gen(7);
@@ -307,7 +307,7 @@ static void test_quantized(ggml_type wtype, uint32_t n_embd, uint32_t n_ff, doub
         GGML_ASSERT(llama_model_get_tensor(model.get(), "blk.0.attn_q.weight")->type == (ref ? GGML_TYPE_F32 : wtype));
 
         llama_context_ptr lctx = make_ctx(model.get(), false, GGML_TYPE_F32, 4);
-        GGML_ASSERT(llama_opt_grad_init(lctx.get(), model.get(), select_norms_and_output, nullptr) == 0);
+        GGML_ASSERT(llama_opt_grad_init(lctx.get(), model.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY, select_norms_and_output, nullptr) == 0);
         if (llama_opt_grad_sequence(lctx.get(), tokens.data(), n_tokens, targets.data(), nullptr) != 0) {
             check(false, "backward pass");
             return;
@@ -331,6 +331,62 @@ static void test_quantized(ggml_type wtype, uint32_t n_embd, uint32_t n_ff, doub
     }
 }
 
+// the weighted-sum loss takes the objective's gradient with respect to the logits: fed the
+// cross-entropy gradient computed outside the graph it reproduces the cross-entropy gradients
+static void test_weighted_sum(llama_model * model) {
+    printf("weighted-sum loss\n");
+    const int n_tokens = 9;
+    std::vector<llama_token> tokens(n_tokens);
+    std::vector<float> onehot((size_t) n_tokens*N_VOCAB, 0.0f);
+    for (int i = 0; i < n_tokens; ++i) {
+        tokens[i] = (i*13 + 4) % N_VOCAB;
+        onehot[(size_t) i*N_VOCAB + (i*7 + 2) % N_VOCAB] = 1.0f;
+    }
+    const char * names[] = {"blk.0.attn_k.weight", "blk.1.ffn_gate.weight", "output.weight"};
+
+    llama_context_ptr ce = make_ctx(model, false, GGML_TYPE_F32, 4);
+    GGML_ASSERT(llama_opt_grad_init(ce.get(), model, GGML_OPT_LOSS_TYPE_CROSS_ENTROPY, select_all, nullptr) == 0);
+    GGML_ASSERT(llama_opt_grad_sequence(ce.get(), tokens.data(), n_tokens, onehot.data(), nullptr) == 0);
+
+    llama_context_ptr ws = make_ctx(model, false, GGML_TYPE_F32, 4);
+    check(llama_opt_grad_init(ws.get(), model, GGML_OPT_LOSS_TYPE_MEAN, select_all, nullptr) == -5, "other loss types refused");
+    check(llama_opt_grad_init(ws.get(), model, GGML_OPT_LOSS_TYPE_WEIGHTED_SUM, select_all, nullptr) == 0, "init");
+    std::vector<float> logits((size_t) n_tokens*N_VOCAB);
+    GGML_ASSERT(llama_opt_grad_sequence(ws.get(), tokens.data(), n_tokens, nullptr, logits.data()) == 0);
+    std::vector<float> dlogits(logits.size());
+    for (int i = 0; i < n_tokens; ++i) {
+        const float * l = logits.data() + (size_t) i*N_VOCAB;
+        double mx = l[0];
+        for (uint32_t j = 1; j < N_VOCAB; ++j) {
+            mx = std::max(mx, (double) l[j]);
+        }
+        double sum = 0.0;
+        for (uint32_t j = 0; j < N_VOCAB; ++j) {
+            sum += std::exp(l[j] - mx);
+        }
+        for (uint32_t j = 0; j < N_VOCAB; ++j) {
+            const size_t k = (size_t) i*N_VOCAB + j;
+            dlogits[k] = (float) ((std::exp(l[j] - mx)/sum - onehot[k]) / n_tokens);
+        }
+    }
+    check(llama_opt_grad_sequence(ws.get(), tokens.data(), n_tokens, dlogits.data(), nullptr) == 0, "backward pass");
+
+    for (const char * name : names) {
+        ggml_tensor * w = llama_model_get_tensor(model, name);
+        const std::vector<float> a = read_f32(llama_opt_grad(ce.get(), w));
+        const std::vector<float> b = read_f32(llama_opt_grad(ws.get(), w));
+        double num = 0.0;
+        double den = 0.0;
+        for (size_t i = 0; i < a.size(); ++i) {
+            num += ((double) a[i] - b[i])*((double) a[i] - b[i]);
+            den += (double) a[i]*a[i];
+        }
+        char what[128];
+        snprintf(what, sizeof(what), "%s matches cross entropy (rel err %.1e)", name, std::sqrt(num/den));
+        check(den > 0.0 && std::sqrt(num/den) < 1e-5, what);
+    }
+}
+
 static void test_repeatable(llama_model * model) {
     printf("repeatability across thread counts\n");
     const int n_tokens = 16;
@@ -343,7 +399,7 @@ static void test_repeatable(llama_model * model) {
     std::vector<std::vector<float>> runs;
     for (int n_threads : {1, 3, 8}) {
         llama_context_ptr lctx = make_ctx(model, false, GGML_TYPE_F32, n_threads);
-        GGML_ASSERT(llama_opt_grad_init(lctx.get(), model, select_all, nullptr) == 0);
+        GGML_ASSERT(llama_opt_grad_init(lctx.get(), model, GGML_OPT_LOSS_TYPE_CROSS_ENTROPY, select_all, nullptr) == 0);
         GGML_ASSERT(llama_opt_grad_sequence(lctx.get(), tokens.data(), n_tokens, targets.data(), nullptr) == 0);
         std::vector<float> all;
         for (const char * name : {"blk.0.attn_k.weight", "blk.1.ffn_down.weight", "output.weight"}) {
@@ -362,13 +418,13 @@ static void test_repeatable(llama_model * model) {
 static void test_refusals(llama_model * model) {
     printf("refusals\n");
     llama_context_ptr lctx = make_ctx(model, false, GGML_TYPE_F16, 4);
-    check(llama_opt_grad_init(lctx.get(), model, select_all, nullptr) == -3, "F16 KV cache refused");
+    check(llama_opt_grad_init(lctx.get(), model, GGML_OPT_LOSS_TYPE_CROSS_ENTROPY, select_all, nullptr) == -3, "F16 KV cache refused");
     std::vector<llama_token> tokens = {1, 2, 3};
     check(llama_opt_grad_sequence(lctx.get(), tokens.data(), 3, nullptr, nullptr) == -1, "pass without init refused");
 
     llama_context_ptr lctx2 = make_ctx(model, false, GGML_TYPE_F32, 4);
     auto none = [](const struct ggml_tensor *, void *) { return false; };
-    check(llama_opt_grad_init(lctx2.get(), model, none, nullptr) == -4, "empty parameter selection refused");
+    check(llama_opt_grad_init(lctx2.get(), model, GGML_OPT_LOSS_TYPE_CROSS_ENTROPY, none, nullptr) == -4, "empty parameter selection refused");
 }
 
 int main(void) {
@@ -393,6 +449,7 @@ int main(void) {
     test_fd(model.get(), false);
     test_fd(model.get(), true);
     test_repeatable(model.get());
+    test_weighted_sum(model.get());
     test_quantized(GGML_TYPE_BF16, N_EMBD, N_FF, 2e-2);
     test_quantized(GGML_TYPE_Q8_0, N_EMBD, 64, 2e-2);
     test_quantized(GGML_TYPE_Q4_0, N_EMBD, 64, 2e-2);

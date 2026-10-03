@@ -3422,9 +3422,12 @@ static int32_t llama_set_params(
     return n_params;
 }
 
-int32_t llama_context::opt_grad_init(struct llama_model * model, llama_opt_param_filter param_filter, void * param_filter_ud) {
+int32_t llama_context::opt_grad_init(struct llama_model * model, enum ggml_opt_loss_type loss_type, llama_opt_param_filter param_filter, void * param_filter_ud) {
     if (opt_ctx) {
         return -1;
+    }
+    if (loss_type != GGML_OPT_LOSS_TYPE_CROSS_ENTROPY && loss_type != GGML_OPT_LOSS_TYPE_WEIGHTED_SUM) {
+        return -5;
     }
 
     std::vector<llama_kv_cache *> kvs;
@@ -3454,7 +3457,7 @@ int32_t llama_context::opt_grad_init(struct llama_model * model, llama_opt_param
         return -4;
     }
 
-    ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
+    ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), loss_type);
     opt_params.build_type = GGML_OPT_BUILD_TYPE_GRAD;
     opt_ctx = ggml_opt_init(opt_params);
     return 0;
@@ -4467,9 +4470,10 @@ void llama_opt_epoch(
 int32_t llama_opt_grad_init(
         struct llama_context  * ctx,
         struct llama_model    * model,
+        enum ggml_opt_loss_type loss_type,
         llama_opt_param_filter  param_filter,
         void                  * param_filter_ud) {
-    return ctx->opt_grad_init(model, param_filter, param_filter_ud);
+    return ctx->opt_grad_init(model, loss_type, param_filter, param_filter_ud);
 }
 
 int32_t llama_opt_grad_sequence(

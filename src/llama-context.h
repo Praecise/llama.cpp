@@ -196,7 +196,7 @@ struct llama_context {
     void opt_init(struct llama_model * model, struct llama_opt_params lopt_params);
 
     // gradient-only training, see llama_opt_grad_init and llama_opt_grad_sequence
-    int32_t opt_grad_init(struct llama_model * model, llama_opt_param_filter param_filter, void * param_filter_ud);
+    int32_t opt_grad_init(struct llama_model * model, enum ggml_opt_loss_type loss_type, llama_opt_param_filter param_filter, void * param_filter_ud);
     int32_t opt_grad_sequence(const llama_token * tokens, int32_t n_tokens, const float * targets, float * logits_out);
     struct ggml_tensor * opt_grad(const struct ggml_tensor * param);
     void opt_grad_reset();

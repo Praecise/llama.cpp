@@ -414,6 +414,18 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             opt_ctx->loss_per_datapoint = true;
             break;
         }
+        case GGML_OPT_LOSS_TYPE_WEIGHTED_SUM: {
+            // the caller supplies the gradient of its objective with respect to the outputs as labels
+            opt_ctx->labels = ggml_dup_tensor(ctx_results, opt_ctx->outputs);
+            ggml_set_input(opt_ctx->labels);
+            ggml_set_name(opt_ctx->labels, "labels");
+            opt_ctx->loss = ggml_mul(ctx_results, opt_ctx->outputs, opt_ctx->labels);
+            ggml_set_name(opt_ctx->loss, "loss_weighted");
+            opt_ctx->loss = ggml_sum(ctx_results, opt_ctx->loss);
+            ggml_set_name(opt_ctx->loss, "loss_weighted_sum");
+            opt_ctx->loss_per_datapoint = false;
+            break;
+        }
         case GGML_OPT_LOSS_TYPE_MEAN_SQUARED_ERROR: {
             opt_ctx->labels = ggml_dup_tensor(ctx_results, opt_ctx->outputs);
             ggml_set_input(opt_ctx->labels);
