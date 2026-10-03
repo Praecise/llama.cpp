@@ -671,6 +671,10 @@ struct ggml_tensor * ggml_opt_grad_acc(ggml_opt_context_t opt_ctx, struct ggml_t
     return opt_ctx->gb_opt ? ggml_graph_get_grad_acc(opt_ctx->gb_opt, node) : nullptr;
 }
 
+struct ggml_cgraph * ggml_opt_eval_graph(ggml_opt_context_t opt_ctx) {
+    return opt_ctx->eval_ready ? opt_ctx->allocated_graph_copy : nullptr;
+}
+
 // ====== Optimization Result ======
 
 ggml_opt_result_t ggml_opt_result_init() {

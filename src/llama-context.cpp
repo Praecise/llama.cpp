@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <string>
 
@@ -3564,6 +3565,21 @@ int32_t llama_context::opt_grad_sequence(const llama_token * tokens, int32_t n_t
             ggml_backend_tensor_memset(labels, 0, 0, ggml_nbytes(labels));
         }
 
+        {
+            ggml_cgraph * graph = ggml_opt_eval_graph(opt_ctx);
+            GGML_ASSERT(graph);
+            // op names are static strings; order them by content
+            std::map<std::string, const char *> names;
+            for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+                const char * name = ggml_op_name(ggml_graph_node(graph, i)->op);
+                names.emplace(name, name);
+            }
+            opt_graph_ops.clear();
+            for (const auto & it : names) {
+                opt_graph_ops.push_back(it.second);
+            }
+        }
+
         ggml_opt_eval(opt_ctx, nullptr);
 
         if (logits_out) {
@@ -4471,6 +4487,15 @@ struct ggml_tensor * llama_opt_grad(struct llama_context * ctx, const struct ggm
 
 void llama_opt_grad_reset(struct llama_context * ctx) {
     ctx->opt_grad_reset();
+}
+
+int32_t llama_opt_grad_n_ops(const struct llama_context * ctx) {
+    return (int32_t) ctx->opt_grad_ops().size();
+}
+
+const char * llama_opt_grad_op(const struct llama_context * ctx, int32_t i) {
+    const auto & ops = ctx->opt_grad_ops();
+    return i >= 0 && (size_t) i < ops.size() ? ops[i] : nullptr;
 }
 
 struct ggml_tensor * llama_model_get_tensor(const struct llama_model * model, const char * name) {

@@ -200,6 +200,7 @@ struct llama_context {
     int32_t opt_grad_sequence(const llama_token * tokens, int32_t n_tokens, const float * targets, float * logits_out);
     struct ggml_tensor * opt_grad(const struct ggml_tensor * param);
     void opt_grad_reset();
+    const std::vector<const char *> & opt_grad_ops() const { return opt_graph_ops; }
 
     // TODO: more flexible combinations of logical/physical batch size and context size
     void opt_epoch(
@@ -356,6 +357,7 @@ private:
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;
+    std::vector<const char *> opt_graph_ops; // distinct op names of the last gradient-only pass
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;

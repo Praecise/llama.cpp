@@ -135,6 +135,17 @@ static void test_fd(llama_model * model, bool flash_attn) {
     check(llama_opt_grad_sequence(lctx.get(), tokens.data(), n_tokens, targets.data(), logits.data()) == 0, "backward pass");
     const double loss0 = ce_loss(logits, targets, n_tokens);
 
+    {
+        std::vector<std::string> ops;
+        for (int32_t i = 0; i < llama_opt_grad_n_ops(lctx.get()); ++i) {
+            ops.push_back(llama_opt_grad_op(lctx.get(), i));
+        }
+        auto has = [&](const char * op) { return std::find(ops.begin(), ops.end(), op) != ops.end(); };
+        check(std::is_sorted(ops.begin(), ops.end()) && std::adjacent_find(ops.begin(), ops.end()) == ops.end() &&
+              has("MUL_MAT") && has("OUT_PROD") && has("CROSS_ENTROPY_LOSS_BACK") && has("SET_ROWS") &&
+              llama_opt_grad_op(lctx.get(), -1) == nullptr, "graph op list");
+    }
+
     const char * names[] = {
         "blk.0.attn_q.weight", "blk.0.attn_k.weight", "blk.0.attn_v.weight", "blk.1.attn_output.weight",
         "blk.1.ffn_up.weight", "blk.0.attn_norm.weight", "output.weight",

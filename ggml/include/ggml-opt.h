@@ -156,6 +156,9 @@ extern "C" {
     // with dynamic graphs too, after the graph that built the accumulator is gone
     GGML_API struct ggml_tensor * ggml_opt_grad_acc(ggml_opt_context_t opt_ctx, struct ggml_tensor * node);
 
+    // the graph ggml_opt_alloc prepared for the next ggml_opt_eval, NULL when none is prepared
+    GGML_API struct ggml_cgraph * ggml_opt_eval_graph(ggml_opt_context_t opt_ctx);
+
     GGML_API enum ggml_opt_optimizer_type ggml_opt_context_optimizer_type(ggml_opt_context_t); //TODO consistent naming scheme
 
     GGML_API const char * ggml_opt_optimizer_name(enum ggml_opt_optimizer_type);

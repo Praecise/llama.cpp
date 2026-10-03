@@ -1668,6 +1668,11 @@ extern "C" {
     // set every parameter gradient to zero
     LLAMA_API void llama_opt_grad_reset(struct llama_context * lctx);
 
+    // distinct op names (ggml_op_name) of the graph the last llama_opt_grad_sequence evaluated,
+    // forward and backward, in ascending order; lets a caller check them against a kernel set
+    LLAMA_API int32_t      llama_opt_grad_n_ops(const struct llama_context * lctx);
+    LLAMA_API const char * llama_opt_grad_op   (const struct llama_context * lctx, int32_t i);
+
     // a weight of the model by its GGUF name, NULL if there is none
     LLAMA_API struct ggml_tensor * llama_model_get_tensor(const struct llama_model * model, const char * name);
 
