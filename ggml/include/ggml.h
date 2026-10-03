@@ -590,6 +590,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_SSM_SCAN_BACK,
+
         GGML_OP_COUNT,
     };
 
@@ -2475,6 +2477,19 @@ extern "C" {
             struct ggml_tensor  * ids,
             int64_t               K);
 
+    // gradients of ggml_ssm_scan (K == 1) given the gradient of its output;
+    // the result concatenates the gradients of x, dt, A, B, C and s, each laid out densely in that input's shape
+    GGML_API struct ggml_tensor * ggml_ssm_scan_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * grad,
+            struct ggml_tensor  * s,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * dt,
+            struct ggml_tensor  * A,
+            struct ggml_tensor  * B,
+            struct ggml_tensor  * C,
+            struct ggml_tensor  * ids);
+
     // partition into non-overlapping windows with padding if needed
     // example:
     // a:   768   64   64    1
@@ -2812,6 +2827,10 @@ extern "C" {
         struct ggml_context *  ctx,        // context for gradient computation
         struct ggml_cgraph  *  cgraph,
         struct ggml_tensor  ** grad_accs);
+
+    // whether ggml_build_backward_expand can differentiate this node, including the conditions it asserts
+    // (for example split GLU variants only); lets a caller refuse a graph instead of aborting
+    GGML_API bool ggml_backward_supported(const struct ggml_tensor * tensor);
 
     // graph allocation in a context
     GGML_API struct ggml_cgraph * ggml_new_graph       (struct ggml_context * ctx); // size = GGML_DEFAULT_GRAPH_SIZE, grads = false

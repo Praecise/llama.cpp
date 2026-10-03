@@ -9869,6 +9869,227 @@ void ggml_compute_forward_ssm_scan(
     }
 }
 
+// ggml_compute_forward_ssm_scan_back
+
+// Work buffer layout, in floats: per-head partial gradients of B and C ({d_state, n_head, n_t, n_s} each),
+// then per thread the recomputed state history of one row ({d_state, n_t}) and its running gradient ({d_state}).
+size_t ggml_ssm_scan_back_work_size(const struct ggml_tensor * dst, int n_threads) {
+    const ggml_tensor * s = dst->src[1];
+    const ggml_tensor * x = dst->src[2];
+
+    const int64_t nc = s->ne[0];
+    const int64_t nh = x->ne[1];
+    const int64_t nt = x->ne[2];
+    const int64_t ns = x->ne[3];
+
+    return sizeof(float)*(2*nc*nh*nt*ns + (size_t) n_threads*(nc*nt + nc));
+}
+
+static void ggml_compute_forward_ssm_scan_back_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * grad = dst->src[0]; // gradient of the ssm_scan output: y, then the final states
+    const ggml_tensor * st0  = dst->src[1]; // s   {d_state, dim, n_head, n_seqs+}
+    const ggml_tensor * xt   = dst->src[2]; // x   {dim, n_head, n_seq_tokens, n_seqs}
+    const ggml_tensor * dtt  = dst->src[3]; // dt  {n_head, n_seq_tokens, n_seqs}
+    const ggml_tensor * At   = dst->src[4]; // A   {d_state, n_head} or {1, n_head}
+    const ggml_tensor * Bt   = dst->src[5]; // B   {d_state, n_group, n_seq_tokens, n_seqs}
+    const ggml_tensor * Ct   = dst->src[6]; // C   {d_state, n_group, n_seq_tokens, n_seqs}
+    const ggml_tensor * idt  = dst->src[7]; // ids {n_seqs}
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nc = st0->ne[0]; // d_state
+    const int64_t nr = st0->ne[1]; // dim
+    const int64_t nh = xt->ne[1];  // n_head
+    const int64_t ng = Bt->ne[1];  // n_group
+    const int64_t nt = xt->ne[2];  // tokens per sequence
+    const int64_t ns = xt->ne[3];  // sequences
+
+    const bool scalar_a = At->ne[0] == 1;
+
+    GGML_ASSERT(nh % ng == 0);
+    GGML_ASSERT(ggml_is_contiguous(grad) && ggml_is_contiguous(st0) && ggml_is_contiguous(dtt) && ggml_is_contiguous(At));
+    GGML_ASSERT(params->wsize >= ggml_ssm_scan_back_work_size(dst, nth));
+
+    // output segments, each dense in its input's shape
+    float * dx  = (float *) dst->data;
+    float * ddt = dx  + ggml_nelements(xt);
+    float * dA  = ddt + ggml_nelements(dtt);
+    float * dB  = dA  + ggml_nelements(At);
+    float * dC  = dB  + ggml_nelements(Bt);
+    float * ds  = dC  + ggml_nelements(Ct);
+
+    float * pB  = (float *) params->wdata;   // {nc, nh, nt, ns}
+    float * pC  = pB + nc*nh*nt*ns;          // {nc, nh, nt, ns}
+    float * sth = pC + nc*nh*nt*ns + ith*(nc*nt + nc); // this thread's state history {nc, nt}
+    float * gs  = sth + nc*nt;                          // running gradient of the current state {nc}
+
+    const float   * gy  = (const float *) grad->data;                      // {dim, n_head, nt, ns}
+    const float   * gsf = gy + ggml_nelements(xt);                         // {nc, dim, n_head, ns}
+    const float   * A   = (const float *) At->data;
+    const int32_t * ids = (const int32_t *) idt->data;
+
+    // heads per thread
+    const int64_t dh  = (nh + nth - 1)/nth;
+    const int64_t ih0 = MIN(dh*ith, nh);
+    const int64_t ih1 = MIN(ih0 + dh, nh);
+
+    if (ith == 0) {
+        memset(ds, 0, ggml_nbytes(st0));
+    }
+
+    // zero everything this thread accumulates into
+    for (int64_t i3 = 0; i3 < ns; ++i3) {
+        for (int64_t t = 0; t < nt; ++t) {
+            for (int64_t h = ih0; h < ih1; ++h) {
+                ddt[h + t*nh + i3*nh*nt] = 0.0f;
+                memset(pB + (h + t*nh + i3*nh*nt)*nc, 0, nc*sizeof(float));
+                memset(pC + (h + t*nh + i3*nh*nt)*nc, 0, nc*sizeof(float));
+            }
+        }
+    }
+    for (int64_t h = ih0; h < ih1; ++h) {
+        for (int64_t i0 = 0; i0 < At->ne[0]; ++i0) {
+            dA[i0 + h*At->ne[0]] = 0.0f;
+        }
+    }
+
+    ggml_barrier(params->threadpool);
+
+    for (int64_t i3 = 0; i3 < ns; ++i3) {
+        const float * s0  = (const float *) ((const char *) st0->data + ids[i3]*st0->nb[3]);
+              float * ds0 = ds + ids[i3]*(nc*nr*nh);
+
+        for (int64_t h = ih0; h < ih1; ++h) {
+            const int64_t g = h / (nh / ng);
+
+            for (int64_t i1 = 0; i1 < nr; ++i1) {
+                const int64_t ii = i1 + h*nr;
+
+                // recompute the state history of this row
+                const float * prev = s0 + ii*nc;
+                for (int64_t t = 0; t < nt; ++t) {
+                    const float   x  = *(const float *) ((const char *) xt->data + t*xt->nb[2] + i3*xt->nb[3] + ii*sizeof(float));
+                    const float   dv = *(const float *) ((const char *) dtt->data + t*dtt->nb[1] + i3*dtt->nb[2] + h*sizeof(float));
+                    const float * B  = (const float *) ((const char *) Bt->data + t*Bt->nb[2] + i3*Bt->nb[3]) + g*nc;
+                    const float   sp = ggml_compute_softplus_f32(dv);
+
+                    float * cur = sth + t*nc;
+                    for (int64_t n = 0; n < nc; ++n) {
+                        const float a = scalar_a ? A[h] : A[n + h*nc];
+                        cur[n] = prev[n]*expf(sp*a) + B[n]*(x*sp);
+                    }
+                    prev = cur;
+                }
+
+                // reverse pass
+                for (int64_t n = 0; n < nc; ++n) {
+                    gs[n] = gsf[n + ii*nc + i3*nc*nr*nh];
+                }
+
+                float da_scalar = 0.0f;
+
+                for (int64_t t = nt - 1; t >= 0; --t) {
+                    const float   x   = *(const float *) ((const char *) xt->data + t*xt->nb[2] + i3*xt->nb[3] + ii*sizeof(float));
+                    const float   dv  = *(const float *) ((const char *) dtt->data + t*dtt->nb[1] + i3*dtt->nb[2] + h*sizeof(float));
+                    const float * B   = (const float *) ((const char *) Bt->data + t*Bt->nb[2] + i3*Bt->nb[3]) + g*nc;
+                    const float * C   = (const float *) ((const char *) Ct->data + t*Ct->nb[2] + i3*Ct->nb[3]) + g*nc;
+                    const float   gyv = gy[ii + t*nh*nr + i3*nh*nr*nt];
+                    const float   sp  = ggml_compute_softplus_f32(dv);
+
+                    const float * cur = sth + t*nc;
+                    const float * prv = t > 0 ? sth + (t - 1)*nc : s0 + ii*nc;
+
+                    float * pBt = pB + (h + t*nh + i3*nh*nt)*nc;
+                    float * pCt = pC + (h + t*nh + i3*nh*nt)*nc;
+
+                    float gb  = 0.0f; // sum_n gs[n]*B[n]
+                    float dsp = 0.0f; // gradient of softplus(dt)
+
+                    for (int64_t n = 0; n < nc; ++n) {
+                        const float a  = scalar_a ? A[h] : A[n + h*nc];
+                        const float da = expf(sp*a);
+
+                        gs[n]  += gyv*C[n];
+                        pCt[n] += gyv*cur[n];
+                        pBt[n] += gs[n]*(x*sp);
+                        gb     += gs[n]*B[n];
+
+                        // decay term prv[n]*exp(sp*a)
+                        const float gd = gs[n]*prv[n]*da;
+                        dsp += gd*a;
+                        if (scalar_a) {
+                            da_scalar += gd*sp;
+                        } else {
+                            dA[n + h*nc] += gd*sp;
+                        }
+
+                        gs[n] *= da;
+                    }
+
+                    dsp += x*gb;
+
+                    dx[ii + t*nh*nr + i3*nh*nr*nt] = sp*gb;
+
+                    // softplus'(dt): the forward returns dt itself above 20
+                    const float dsp_ddt = dv > 20.0f ? 1.0f : 1.0f/(1.0f + expf(-dv));
+                    ddt[h + t*nh + i3*nh*nt] += dsp*dsp_ddt;
+                }
+
+                if (scalar_a) {
+                    dA[h] += da_scalar;
+                }
+
+                for (int64_t n = 0; n < nc; ++n) {
+                    ds0[n + ii*nc] += gs[n];
+                }
+            }
+        }
+    }
+
+    ggml_barrier(params->threadpool);
+
+    // sum the per-head partials over the heads of each group, in head order
+    const int64_t nrows = ng*nt*ns;
+    for (int64_t r = ith; r < nrows; r += nth) {
+        const int64_t g  = r % ng;
+        const int64_t t  = (r / ng) % nt;
+        const int64_t i3 = r / (ng*nt);
+
+        float * dBr = dB + (g + t*ng + i3*ng*nt)*nc;
+        float * dCr = dC + (g + t*ng + i3*ng*nt)*nc;
+        memset(dBr, 0, nc*sizeof(float));
+        memset(dCr, 0, nc*sizeof(float));
+
+        const int64_t hpg = nh / ng;
+        for (int64_t h = g*hpg; h < (g + 1)*hpg; ++h) {
+            const float * pBt = pB + (h + t*nh + i3*nh*nt)*nc;
+            const float * pCt = pC + (h + t*nh + i3*nh*nt)*nc;
+            for (int64_t n = 0; n < nc; ++n) {
+                dBr[n] += pBt[n];
+                dCr[n] += pCt[n];
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_ssm_scan_back(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[1]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_ssm_scan_back_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_win_part
 
 static void ggml_compute_forward_win_part_f32(

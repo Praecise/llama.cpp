@@ -318,7 +318,7 @@ static double jdst(const T * a, const T * b, size_t n) {
 // n: number of values to compare.
 // expected_vals: optional vector of expected values for a. If expected_vals is not empty, filter out all comparisons where
 //     a does not match any of the expected values. Needed for noncontinuous gradients where the numerical calculation can fail.
-static double mean_abs_asymm(const float * a, const float * b, const size_t n, const std::vector<float> & expected_vals) {
+static double mean_abs_asymm(const float * a, const float * b, const size_t n, const std::vector<float> & expected_vals, const double atol = 0.0) {
     double sum = 0.0f;
 
     size_t nvalid = 0;
@@ -336,10 +336,16 @@ static double mean_abs_asymm(const float * a, const float * b, const size_t n, c
             }
         }
 
+        nvalid++;
+
+        // entries that agree within the absolute tolerance count as exact
+        if (atol > 0.0 && fabs((double) a[i] - (double) b[i]) <= atol) {
+            continue;
+        }
+
         const float asymm = (a[i] - b[i]) / (a[i] + b[i]);
 
         sum += fabsf(asymm);
-        nvalid++;
     }
 
     return sum/nvalid;
@@ -1181,6 +1187,12 @@ struct test_case {
         return false;
     }
 
+    // Absolute difference below which a gradient entry counts as matching; the asymmetric error
+    // (a - b)/(a + b) is otherwise dominated by entries whose true gradient is near zero.
+    virtual double grad_atol() {
+        return 0.0;
+    }
+
     // Skip gradient checks if total number of gradients to be checked is larger than this (to speed up the tests).
     virtual int64_t grad_nmax() {
         return 10000;
@@ -1770,6 +1782,17 @@ struct test_case {
         ggml_set_loss(out);
 
         ggml_build_forward_expand(gf, out);
+
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            if (!ggml_backward_supported(node)) {
+                output_printer->print_operation(test_operation_info(op_desc(out), vars(), ggml_backend_name(backend),
+                                                                    test_status_t::NOT_SUPPORTED,
+                                                                    std::string("no backward for ") + ggml_op_desc(node)));
+                return true;
+            }
+        }
+
         ggml_graph_cpy(gf, gb);
         ggml_build_backward_expand(ctx.get(), gb, nullptr);
         if (expect.size() != 1 || expect[0] != 0.0f) {
@@ -1910,7 +1933,7 @@ struct test_case {
                 ggml_backend_tensor_set(t, x0.data(), 0, ggml_nbytes(t));
             }
 
-            const double err = mean_abs_asymm(gn.data(), ga.data(), gn.size(), expect);
+            const double err = mean_abs_asymm(gn.data(), ga.data(), gn.size(), expect, grad_atol());
             if (err > max_maa_err()) {
                 test_operation_info info(op_desc(out), vars(), ggml_backend_name(backend));
                 info.set_maa_error(err, max_maa_err());
@@ -2142,30 +2165,41 @@ struct test_glu_split : public test_case {
         : op(op), type(type), ne_a(ne_a), v(v) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
+        const bool grad_supported = op == GGML_GLU_OP_SWIGLU || op == GGML_GLU_OP_REGLU ||
+            op == GGML_GLU_OP_GEGLU || op == GGML_GLU_OP_GEGLU_QUICK;
+
         ggml_tensor * a;
         ggml_tensor * b;
         if (v & 1) {
             auto ne = ne_a; ne[0] *= 3;
             a = ggml_new_tensor(ctx, type, 4, ne.data());
-            ggml_set_param(a);
+            if (grad_supported) {
+                ggml_set_param(a);
+            }
             ggml_set_name(a, "a");
 
             a = ggml_view_4d(ctx, a, ne_a[0], ne_a[1], ne_a[2], ne_a[3], a->nb[1], a->nb[2], a->nb[3], 0);
             ggml_set_name(a, "view_of_a");
 
             b = ggml_new_tensor(ctx, type, 4, ne.data());
-            ggml_set_param(b);
+            if (grad_supported) {
+                ggml_set_param(b);
+            }
             ggml_set_name(b, "b");
 
             b = ggml_view_4d(ctx, b, ne_a[0], ne_a[1], ne_a[2], ne_a[3], b->nb[1], b->nb[2], b->nb[3], 0);
             ggml_set_name(a, "view_of_b");
         } else {
             a = ggml_new_tensor(ctx, type, 4, ne_a.data());
-            ggml_set_param(a);
+            if (grad_supported) {
+                ggml_set_param(a);
+            }
             ggml_set_name(a, "a");
 
             b = ggml_new_tensor(ctx, type, 4, ne_a.data());
-            ggml_set_param(b);
+            if (grad_supported) {
+                ggml_set_param(b);
+            }
             ggml_set_name(b, "b");
         }
 
@@ -8302,6 +8336,630 @@ static const ggml_type other_types[] = {
 #endif
 
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
+// ###########################################
+// ## Section 2b: training backward coverage ##
+// ###########################################
+
+// Gradient checks for the backward passes that training on serving graphs needs.
+// Every case marks its differentiable inputs as params, so `grad` mode checks them
+// against finite differences; in the other modes they are ordinary forward tests.
+// Entries that agree within 1e-4 absolute count as exact, since the error metric
+// (a - b)/(a + b) is otherwise dominated by near-zero gradient entries.
+
+struct test_unary_grad : public test_case {
+    const ggml_unary_op op;
+    const std::array<int64_t, 4> ne;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return std::string("UNARY_GRAD_") + ggml_unary_op_name(op);
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR1(ne);
+    }
+
+    test_unary_grad(ggml_unary_op op, std::array<int64_t, 4> ne = {16, 3, 2, 1})
+        : op(op), ne(ne) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * out = ggml_unary(ctx, a, op);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -3.0f, 3.0f);
+        }
+    }
+
+    // the CPU GELU forward reads an F16 lookup table, so its finite differences need a wider step
+    bool table_forward() const {
+        return op == GGML_UNARY_OP_GELU || op == GGML_UNARY_OP_GELU_QUICK;
+    }
+
+    float grad_eps() override {
+        return table_forward() ? 1e-1f : 1e-2f;
+    }
+
+    bool grad_precise() override {
+        return true;
+    }
+
+    double grad_atol() override {
+        return table_forward() ? 3e-2 : 1e-4;
+    }
+
+    double max_maa_err() override {
+        return table_forward() ? 1e-2 : 1e-3;
+    }
+};
+
+struct test_norm_grad : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float eps;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "NORM_GRAD";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, eps);
+    }
+
+    test_norm_grad(std::array<int64_t, 4> ne = {16, 5, 3, 1}, float eps = 1e-5f)
+        : ne(ne), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+
+        // a weighted sum, so the gradient is not identically zero
+        ggml_tensor * w = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(w, "w");
+
+        ggml_tensor * out = ggml_mul(ctx, ggml_norm(ctx, a, eps), w);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    bool grad_precise() override {
+        return true;
+    }
+
+    double grad_atol() override {
+        return 1e-4;
+    }
+
+    float grad_eps() override {
+        return 1e-2f;
+    }
+
+    double max_maa_err() override {
+        return 1e-3;
+    }
+};
+
+struct test_group_norm_grad : public test_case {
+    const std::array<int64_t, 4> ne;
+    const int32_t n_groups;
+    const float eps;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GROUP_NORM_GRAD";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, n_groups, eps);
+    }
+
+    test_group_norm_grad(std::array<int64_t, 4> ne = {4, 3, 6, 2}, int32_t n_groups = 3, float eps = 1e-5f)
+        : ne(ne), n_groups(n_groups), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * w = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(w, "w");
+
+        ggml_tensor * out = ggml_mul(ctx, ggml_group_norm(ctx, a, n_groups, eps), w);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    bool grad_precise() override {
+        return true;
+    }
+
+    double grad_atol() override {
+        return 1e-4;
+    }
+
+    float grad_eps() override {
+        return 1e-2f;
+    }
+
+    double max_maa_err() override {
+        return 1e-3;
+    }
+};
+
+struct test_set_rows_grad : public test_case {
+    const int64_t ne0;
+    const int64_t n_dst;
+    const int64_t n_src;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SET_ROWS_GRAD";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne0, n_dst, n_src);
+    }
+
+    test_set_rows_grad(int64_t ne0 = 8, int64_t n_dst = 10, int64_t n_src = 4)
+        : ne0(ne0), n_dst(n_dst), n_src(n_src) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * dst = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, n_dst);
+        ggml_set_name(dst, "dst");
+
+        ggml_tensor * src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, n_src);
+        ggml_set_param(src);
+        ggml_set_name(src, "src");
+
+        ggml_tensor * idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_src);
+        ggml_set_name(idx, "idx");
+
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, n_dst);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * out = ggml_mul(ctx, ggml_set_rows(ctx, dst, src, idx), w);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> rows(n_dst);
+                for (int64_t i = 0; i < n_dst; ++i) {
+                    rows[i] = (int32_t) i;
+                }
+                std::shuffle(rows.begin(), rows.end(), rng);
+                ggml_backend_tensor_set(t, rows.data(), 0, n_src*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+struct test_flash_attn_ext_grad : public test_case {
+    const int64_t hsk;
+    const int64_t hsv;
+    const int64_t nh;      // kv heads
+    const int64_t nr;      // query heads per kv head
+    const int64_t kv;
+    const int64_t nb;
+    const bool mask;
+    const float max_bias;
+    const float logit_softcap;
+    const bool permuted_q; // q as the permuted view a graph builder produces
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "FLASH_ATTN_EXT_GRAD";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR10(hsk, hsv, nh, nr, kv, nb, mask, max_bias, logit_softcap, permuted_q);
+    }
+
+    test_flash_attn_ext_grad(int64_t hsk = 8, int64_t hsv = 8, int64_t nh = 2, int64_t nr = 1, int64_t kv = 7, int64_t nb = 5,
+            bool mask = true, float max_bias = 0.0f, float logit_softcap = 0.0f, bool permuted_q = false)
+        : hsk(hsk), hsv(hsv), nh(nh), nr(nr), kv(kv), nb(nb), mask(mask), max_bias(max_bias), logit_softcap(logit_softcap), permuted_q(permuted_q) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q;
+        if (permuted_q) {
+            q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hsk, nh*nr, nb);
+            ggml_set_param(q);
+            ggml_set_name(q, "q");
+            q = ggml_permute(ctx, q, 0, 2, 1, 3);
+        } else {
+            q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hsk, nb, nh*nr);
+            ggml_set_param(q);
+            ggml_set_name(q, "q");
+        }
+
+        ggml_tensor * k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hsk, kv, nh);
+        ggml_set_param(k);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * v = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hsv, kv, nh);
+        ggml_set_param(v);
+        ggml_set_name(v, "v");
+
+        ggml_tensor * m = nullptr;
+        if (mask) {
+            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
+            ggml_set_name(m, "m");
+        }
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+
+        // weight the output so the gradient is not identically zero
+        ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, out->ne[0], out->ne[1], out->ne[2], out->ne[3]);
+        ggml_set_name(w, "w");
+
+        return ggml_mul(ctx, out, w);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                // causal mask with random finite biases: query i sees keys j <= i + (kv - nb)
+                std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                std::random_device rd;
+                std::mt19937 gen(rd());
+                std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+                for (int64_t i1 = 0; i1 < t->ne[1]; ++i1) {
+                    for (int64_t i0 = 0; i0 < t->ne[0]; ++i0) {
+                        const float val = i0 <= i1 + (kv - nb) ? dis(gen) : -INFINITY;
+                        data[i1*t->ne[0] + i0] = ggml_fp32_to_fp16(val);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    bool grad_precise() override {
+        return true;
+    }
+
+    double grad_atol() override {
+        return 1e-4;
+    }
+
+    float grad_eps() override {
+        return 1e-2f;
+    }
+
+    double max_maa_err() override {
+        return 1e-3;
+    }
+};
+
+struct test_mul_mat_id_grad : public test_case {
+    const int n_mats;
+    const int n_used;
+    const bool b_bcast;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_GRAD";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR6(n_mats, n_used, b_bcast, m, n, k);
+    }
+
+    test_mul_mat_id_grad(int n_mats = 4, int n_used = 2, bool b_bcast = false, int64_t m = 6, int64_t n = 5, int64_t k = 7)
+        : n_mats(n_mats), n_used(n_used), b_bcast(b_bcast), m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, m, n_mats);
+        ggml_set_param(as);
+        ggml_set_name(as, "as");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        ggml_set_name(ids, "ids");
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, b_bcast ? 1 : n_used, n);
+        ggml_set_param(b);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
+        ggml_set_name(out, "out");
+
+        ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, m, n_used, n);
+        ggml_set_name(w, "w");
+
+        return ggml_mul(ctx, out, w);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                for (int64_t r = 0; r < t->ne[1]; ++r) {
+                    std::vector<int32_t> experts(n_mats);
+                    for (int i = 0; i < n_mats; ++i) {
+                        experts[i] = i;
+                    }
+                    std::shuffle(experts.begin(), experts.end(), rng);
+                    ggml_backend_tensor_set(t, experts.data(), r*t->nb[1], n_used*sizeof(int32_t));
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    bool grad_precise() override {
+        return true;
+    }
+
+    double grad_atol() override {
+        return 1e-4;
+    }
+
+    float grad_eps() override {
+        return 1e-2f;
+    }
+
+    double max_maa_err() override {
+        return 1e-3;
+    }
+};
+
+struct test_conv_2d_grad : public test_case {
+    const std::array<int64_t, 4> ne_input; // [W, H, IC, N]
+    const std::array<int64_t, 4> ne_kernel; // [KW, KH, IC, OC]
+    const int s0, s1, p0, p1, d0, d1;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONV_2D_GRAD";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR8(ne_input, ne_kernel, s0, s1, p0, p1, d0, d1);
+    }
+
+    test_conv_2d_grad(std::array<int64_t, 4> ne_input = {6, 5, 2, 2}, std::array<int64_t, 4> ne_kernel = {3, 3, 2, 3},
+            int s0 = 1, int s1 = 1, int p0 = 1, int p1 = 1, int d0 = 1, int d1 = 1)
+        : ne_input(ne_input), ne_kernel(ne_kernel), s0(s0), s1(s1), p0(p0), p1(p1), d0(d0), d1(d1) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_input.data());
+        ggml_set_param(x);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * kernel = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_kernel.data());
+        ggml_set_param(kernel);
+        ggml_set_name(kernel, "kernel");
+
+        ggml_tensor * out = ggml_conv_2d_direct(ctx, kernel, x, s0, s1, p0, p1, d0, d1);
+        ggml_set_name(out, "out");
+
+        ggml_tensor * w = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, out->ne);
+        ggml_set_name(w, "w");
+
+        return ggml_mul(ctx, out, w);
+    }
+
+    bool grad_precise() override {
+        return true;
+    }
+
+    double grad_atol() override {
+        return 1e-4;
+    }
+
+    float grad_eps() override {
+        return 1e-2f;
+    }
+
+    double max_maa_err() override {
+        return 1e-3;
+    }
+};
+
+struct test_ssm_conv_grad : public test_case {
+    const int64_t d_conv;
+    const int64_t d_inner;
+    const int64_t n_t;
+    const int64_t n_s;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_GRAD";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(d_conv, d_inner, n_t, n_s);
+    }
+
+    test_ssm_conv_grad(int64_t d_conv = 4, int64_t d_inner = 5, int64_t n_t = 6, int64_t n_s = 2)
+        : d_conv(d_conv), d_inner(d_inner), n_t(n_t), n_s(n_s) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * sx = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv - 1 + n_t, d_inner, n_s);
+        ggml_set_param(sx);
+        ggml_set_name(sx, "sx");
+
+        ggml_tensor * c = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, d_inner);
+        ggml_set_param(c);
+        ggml_set_name(c, "c");
+
+        ggml_tensor * out = ggml_ssm_conv(ctx, sx, c);
+        ggml_set_name(out, "out");
+
+        ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, n_t, n_s);
+        ggml_set_name(w, "w");
+
+        return ggml_mul(ctx, out, w);
+    }
+
+    bool grad_precise() override {
+        return true;
+    }
+
+    double grad_atol() override {
+        return 1e-4;
+    }
+
+    float grad_eps() override {
+        return 1e-2f;
+    }
+
+    double max_maa_err() override {
+        return 1e-3;
+    }
+};
+
+struct test_ssm_scan_grad : public test_case {
+    const int64_t d_state;
+    const int64_t head_dim; // 1 = Mamba-1; > 1 = Mamba-2 (scalar A per head)
+    const int64_t n_head;
+    const int64_t n_group;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_SCAN_GRAD";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR6(d_state, head_dim, n_head, n_group, n_seq_tokens, n_seqs);
+    }
+
+    test_ssm_scan_grad(int64_t d_state = 5, int64_t head_dim = 3, int64_t n_head = 4, int64_t n_group = 2,
+            int64_t n_seq_tokens = 4, int64_t n_seqs = 2)
+        : d_state(d_state), head_dim(head_dim), n_head(n_head), n_group(n_group), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * s  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d_state, head_dim, n_head, n_seqs);
+        ggml_tensor * x  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, n_head, n_seq_tokens, n_seqs);
+        ggml_tensor * dt = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_head, n_seq_tokens, n_seqs);
+        ggml_tensor * A  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim > 1 ? 1 : d_state, n_head);
+        ggml_tensor * B  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d_state, n_group, n_seq_tokens, n_seqs);
+        ggml_tensor * C  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d_state, n_group, n_seq_tokens, n_seqs);
+        ggml_set_name(s, "s");
+        ggml_set_name(x, "x");
+        ggml_set_name(dt, "dt");
+        ggml_set_name(A, "A");
+        ggml_set_name(B, "B");
+        ggml_set_name(C, "C");
+        for (ggml_tensor * t : {s, x, dt, A, B, C}) {
+            ggml_set_param(t);
+        }
+
+        ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        ggml_set_name(ids, "ids");
+
+        ggml_tensor * out = ggml_ssm_scan(ctx, s, x, dt, A, B, C, ids, 1);
+        ggml_set_name(out, "out");
+
+        // weights cover both the outputs y and the final states
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out->ne[0]);
+        ggml_set_name(w, "w");
+
+        return ggml_mul(ctx, out, w);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(t->ne[0]);
+                for (int i = 0; i < t->ne[0]; i++) {
+                    data[i] = i;
+                }
+                std::shuffle(data.begin(), data.end(), rng);
+                ggml_backend_tensor_set(t, data.data(), 0, t->ne[0]*sizeof(int32_t));
+            } else if (strcmp(t->name, "A") == 0) {
+                init_tensor_uniform(t, -1.0f, -0.1f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    bool grad_precise() override {
+        return true;
+    }
+
+    double grad_atol() override {
+        return 1e-4;
+    }
+
+    float grad_eps() override {
+        return 1e-2f;
+    }
+
+    double max_maa_err() override {
+        return 1e-3;
+    }
+};
+
+static void add_training_grad_test_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    for (ggml_unary_op op : {GGML_UNARY_OP_TANH, GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_GELU, GGML_UNARY_OP_GELU_QUICK}) {
+        test_cases.emplace_back(new test_unary_grad(op));
+    }
+
+    test_cases.emplace_back(new test_norm_grad({16, 5, 3, 1}));
+    test_cases.emplace_back(new test_norm_grad({7, 4, 1, 2}, 1e-3f));
+    test_cases.emplace_back(new test_group_norm_grad({4, 3, 6, 2}, 3));
+    test_cases.emplace_back(new test_group_norm_grad({5, 2, 4, 1}, 2));
+
+    test_cases.emplace_back(new test_set_rows_grad());
+
+    for (bool mask : {false, true}) {
+        for (int64_t nr : {1, 2}) {
+            for (bool permuted_q : {false, true}) {
+                test_cases.emplace_back(new test_flash_attn_ext_grad(8, 8, 2, nr, 7, 5, mask, 0.0f, 0.0f, permuted_q));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_grad(8, 6, 2, 2, 9, 4, true, 0.0f, 20.0f, true));
+
+    for (bool b_bcast : {false, true}) {
+        test_cases.emplace_back(new test_mul_mat_id_grad(4, 2, b_bcast));
+        test_cases.emplace_back(new test_mul_mat_id_grad(5, 3, b_bcast, 4, 3, 6));
+    }
+
+    test_cases.emplace_back(new test_conv_2d_grad());
+    test_cases.emplace_back(new test_conv_2d_grad({7, 6, 2, 1}, {3, 2, 2, 2}, 2, 1, 0, 1, 1, 2));
+
+    test_cases.emplace_back(new test_ssm_conv_grad());
+    test_cases.emplace_back(new test_ssm_conv_grad(3, 4, 5, 1));
+
+    test_cases.emplace_back(new test_ssm_scan_grad());
+    test_cases.emplace_back(new test_ssm_scan_grad(4, 1, 3, 1, 5, 2));
+    test_cases.emplace_back(new test_ssm_scan_grad(4, 2, 2, 1, 3, 1));
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
@@ -10020,6 +10678,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {30000, 1, 1, 1}));
 
     test_cases.emplace_back(new test_opt_step_adamw(GGML_TYPE_F32, {10, 5, 4, 3}));
+
+    add_training_grad_test_cases(test_cases);
     test_cases.emplace_back(new test_opt_step_sgd(GGML_TYPE_F32, {10, 5, 4, 3}));
 
     for (ggml_type type : base_types) {
