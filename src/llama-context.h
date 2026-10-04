@@ -197,6 +197,7 @@ struct llama_context {
 
     // gradient-only training, see llama_opt_grad_init and llama_opt_grad_sequence
     int32_t opt_grad_init(struct llama_model * model, enum ggml_opt_loss_type loss_type, llama_opt_param_filter param_filter, void * param_filter_ud);
+    int64_t opt_grad_output_size(int32_t n_tokens) const;
     int32_t opt_grad_sequence(const llama_token * tokens, int32_t n_tokens, const float * targets, float * logits_out);
     struct ggml_tensor * opt_grad(const struct ggml_tensor * param);
     void opt_grad_reset();
@@ -357,6 +358,7 @@ private:
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;
+    bool opt_grad_graphs = false; // graphs sized for a backward pass, see opt_grad_init
     std::vector<const char *> opt_graph_ops; // distinct op names of the last gradient-only pass
 
     ggml_threadpool_t threadpool       = nullptr;

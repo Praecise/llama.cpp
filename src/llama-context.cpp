@@ -2354,6 +2354,10 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (n_sampling_outputs_max > 1) {
         res += (n_sampling_outputs_max - 1) * n_sampling_nodes_max;
     }
+    if (opt_grad_graphs) {
+        // a gradient graph holds the forward pass, its backward pass and the gradient accumulation
+        res *= 4;
+    }
     return res;
 }
 
@@ -3429,6 +3433,25 @@ int32_t llama_context::opt_grad_init(struct llama_model * model, enum ggml_opt_l
     if (loss_type != GGML_OPT_LOSS_TYPE_CROSS_ENTROPY && loss_type != GGML_OPT_LOSS_TYPE_WEIGHTED_SUM) {
         return -5;
     }
+    // weights in a CPU extra buffer type (repacked layouts) only support the forward matmul ops
+    if (auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+        auto get_extra_bufts = (ggml_backend_dev_get_extra_bufts_t)
+            ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(cpu_dev), "ggml_backend_dev_get_extra_bufts");
+        ggml_backend_buffer_type_t * extra = get_extra_bufts ? get_extra_bufts(cpu_dev) : nullptr;
+        for (const auto & it : model->tensors_by_name) {
+            if (!it.second->buffer) {
+                continue;
+            }
+            const ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(it.second->buffer);
+            for (auto * e = extra; e && *e; ++e) {
+                if (buft == *e) {
+                    LLAMA_LOG_ERROR("%s: %s is in the %s buffer type; load the model without extra buffer types\n",
+                            __func__, it.first.c_str(), ggml_backend_buft_name(buft));
+                    return -6;
+                }
+            }
+        }
+    }
 
     std::vector<llama_kv_cache *> kvs;
     if (memory) {
@@ -3457,10 +3480,27 @@ int32_t llama_context::opt_grad_init(struct llama_model * model, enum ggml_opt_l
         return -4;
     }
 
+    // size the graphs and the scheduler for gradient graphs before the optimizer context takes the scheduler
+    opt_grad_graphs    = true;
+    sched_need_reserve = true;
+    sched_reserve();
+
     ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), loss_type);
     opt_params.build_type = GGML_OPT_BUILD_TYPE_GRAD;
     opt_ctx = ggml_opt_init(opt_params);
     return 0;
+}
+
+int64_t llama_context::opt_grad_output_size(int32_t n_tokens) const {
+    const auto & hparams = model.hparams;
+    if (!cparams.embeddings) {
+        return (int64_t) n_tokens * model.vocab.n_tokens();
+    }
+    switch (cparams.pooling_type) {
+        case LLAMA_POOLING_TYPE_NONE: return (int64_t) n_tokens * hparams.n_embd_out();
+        case LLAMA_POOLING_TYPE_RANK: return hparams.n_cls_out;
+        default:                      return hparams.n_embd_out();
+    }
 }
 
 int32_t llama_context::opt_grad_sequence(const llama_token * tokens, int32_t n_tokens, const float * targets, float * logits_out) {
@@ -3534,7 +3574,16 @@ int32_t llama_context::opt_grad_sequence(const llama_token * tokens, int32_t n_t
         res->reset();
         auto * gf = model.build_graph(gparams);
 
+        // the differentiated outputs: logits, or the embeddings an embedding context returns
         struct ggml_tensor * logits = res->get_logits();
+        if (cparams.embeddings) {
+            logits = cparams.pooling_type == LLAMA_POOLING_TYPE_NONE ? res->get_embd() : res->get_embd_pooled();
+        }
+        if (!logits || ggml_nelements(logits) != opt_grad_output_size(n_tokens)) {
+            LLAMA_LOG_ERROR("%s: the graph has no output of the expected size\n", __func__);
+            ret = -2;
+            break;
+        }
         ggml_set_output(logits);
 
         if (targets) {
@@ -3561,7 +3610,7 @@ int32_t llama_context::opt_grad_sequence(const llama_token * tokens, int32_t n_t
 
         res->set_inputs(&ubatch);
         struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
-        GGML_ASSERT(labels->ne[1] == n_tokens);
+        GGML_ASSERT(ggml_nelements(labels) == ggml_nelements(logits));
         if (targets) {
             ggml_backend_tensor_set(labels, targets, 0, ggml_nbytes(labels));
         } else {
@@ -4483,6 +4532,10 @@ int32_t llama_opt_grad_sequence(
         const float          * targets,
         float                * logits_out) {
     return ctx->opt_grad_sequence(tokens, n_tokens, targets, logits_out);
+}
+
+int64_t llama_opt_grad_output_size(const struct llama_context * ctx, int32_t n_tokens) {
+    return ctx->opt_grad_output_size(n_tokens);
 }
 
 struct ggml_tensor * llama_opt_grad(struct llama_context * ctx, const struct ggml_tensor * param) {

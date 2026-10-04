@@ -1644,7 +1644,8 @@ extern "C" {
     // respect to the logits, for objectives computed outside the graph)
     // returns 0 on success, -1 if the context already trains, -2 if its memory has no
     // differentiable path, -3 if the KV cache is not F32, -4 if no parameter is selected,
-    // -5 for another loss type
+    // -5 for another loss type, -6 if a weight is in a CPU extra buffer type (load the model with
+    // use_extra_bufts = false)
     LLAMA_API int32_t llama_opt_grad_init(
             struct llama_context  * lctx,
             struct llama_model    * model,
@@ -1652,21 +1653,26 @@ extern "C" {
             llama_opt_param_filter  param_filter,
             void                  * param_filter_ud);
 
+    // number of floats in the outputs of a pass over n_tokens: the logits (n_tokens x n_vocab) of
+    // a generative context; for an embedding context the per-token embeddings (pooling none,
+    // n_tokens x n_embd_out), the rank scores (n_cls_out) or the pooled embedding (n_embd_out)
+    LLAMA_API int64_t llama_opt_grad_output_size(const struct llama_context * lctx, int32_t n_tokens);
+
     // One sequence at positions 0..n_tokens-1 from an empty memory, in a single ubatch.
-    // logits_out (n_tokens x n_vocab floats, may be NULL) receives the forward logits.
-    // With targets (n_tokens x n_vocab floats) the pass also runs backward and adds to the
-    // parameter gradients the gradient of
-    //   cross entropy: -sum_rows sum(targets * log_softmax(logits)) / n_tokens, whose gradient with
-    //                  respect to a row is (softmax(row) * sum(target row) - target row) / n_tokens
-    //   weighted sum:  sum(targets * logits), whose gradient with respect to the logits is targets
-    // returns 0 on success, -1 without llama_opt_grad_init, -2 if n_tokens exceeds the ubatch,
-    // -3 if the graph needs a gradient through an op without a backward (logged by name)
+    // outputs (llama_opt_grad_output_size floats, may be NULL) receives the forward outputs.
+    // With targets (as many floats) the pass also runs backward and adds to the parameter
+    // gradients the gradient of
+    //   cross entropy: -sum_rows sum(targets * log_softmax(outputs)) / n_rows, whose gradient with
+    //                  respect to a row is (softmax(row) * sum(target row) - target row) / n_rows
+    //   weighted sum:  sum(targets * outputs), whose gradient with respect to the outputs is targets
+    // returns 0 on success, -1 without llama_opt_grad_init, -2 if n_tokens exceeds the ubatch or
+    // the graph lacks the outputs, -3 if the graph needs a gradient through an op without a backward (logged by name)
     LLAMA_API int32_t llama_opt_grad_sequence(
             struct llama_context * lctx,
             const llama_token    * tokens,
             int32_t                n_tokens,
             const float          * targets,
-            float                * logits_out);
+            float                * outputs);
 
     // gradient accumulator of a parameter tensor (F32, same shape); NULL if it is not a parameter
     // or before the first pass with targets

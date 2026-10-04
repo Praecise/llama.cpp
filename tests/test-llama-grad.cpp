@@ -387,6 +387,67 @@ static void test_weighted_sum(llama_model * model) {
     }
 }
 
+// an embedding context differentiates its pooled embedding: weighted-sum gradients of
+// sum(w * embedding) match finite differences
+static void test_embeddings(llama_model * model) {
+    printf("pooled embeddings\n");
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = N_CTX; cp.n_batch = N_CTX; cp.n_ubatch = N_CTX; cp.n_seq_max = 1;
+    cp.n_threads = 4; cp.n_threads_batch = 4;
+    cp.type_k = GGML_TYPE_F32; cp.type_v = GGML_TYPE_F32;
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    cp.embeddings = true;
+    cp.pooling_type = LLAMA_POOLING_TYPE_MEAN;
+    llama_context_ptr lctx(llama_init_from_model(model, cp));
+    GGML_ASSERT(lctx);
+    check(llama_opt_grad_init(lctx.get(), model, GGML_OPT_LOSS_TYPE_WEIGHTED_SUM, select_all, nullptr) == 0, "init");
+
+    const int n_tokens = 7;
+    const int64_t n_out = llama_opt_grad_output_size(lctx.get(), n_tokens);
+    check(n_out == N_EMBD, "output size is the embedding width");
+    std::vector<llama_token> tokens(n_tokens);
+    for (int i = 0; i < n_tokens; ++i) {
+        tokens[i] = (i*11 + 3) % N_VOCAB;
+    }
+    std::vector<float> w(n_out);
+    for (int64_t i = 0; i < n_out; ++i) {
+        w[i] = std::sin(0.7f*i + 0.3f);
+    }
+    std::vector<float> emb(n_out);
+    check(llama_opt_grad_sequence(lctx.get(), tokens.data(), n_tokens, w.data(), emb.data()) == 0, "backward pass");
+    auto objective = [&](const std::vector<float> & e) {
+        double v = 0.0;
+        for (int64_t i = 0; i < n_out; ++i) {
+            v += (double) w[i]*e[i];
+        }
+        return v;
+    };
+    for (const char * name : {"blk.0.attn_v.weight", "blk.1.ffn_up.weight", "blk.0.attn_norm.weight"}) {
+        ggml_tensor * t = llama_model_get_tensor(model, name);
+        const std::vector<float> grad = read_f32(llama_opt_grad(lctx.get(), t));
+        std::vector<float> data = read_f32(t);
+        size_t imax = 0;
+        for (size_t i = 1; i < grad.size(); ++i) {
+            imax = std::fabs(grad[i]) > std::fabs(grad[imax]) ? i : imax;
+        }
+        const float eps = 1e-2f;
+        const float x = data[imax];
+        double l[2];
+        for (int sgn = 0; sgn < 2; ++sgn) {
+            data[imax] = x + (sgn == 0 ? eps : -eps);
+            ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            GGML_ASSERT(llama_opt_grad_sequence(lctx.get(), tokens.data(), n_tokens, nullptr, emb.data()) == 0);
+            l[sgn] = objective(emb);
+        }
+        data[imax] = x;
+        ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+        const double fd = (l[0] - l[1]) / (2.0*eps);
+        char what[128];
+        snprintf(what, sizeof(what), "%s (g %.3e, fd %.3e)", name, grad[imax], fd);
+        check(std::fabs(grad[imax]) > 1e-5 && std::fabs(fd - grad[imax]) <= 1e-2*std::fabs(grad[imax]) + 1e-5, what);
+    }
+}
+
 static void test_repeatable(llama_model * model) {
     printf("repeatability across thread counts\n");
     const int n_tokens = 16;
@@ -450,6 +511,7 @@ int main(void) {
     test_fd(model.get(), true);
     test_repeatable(model.get());
     test_weighted_sum(model.get());
+    test_embeddings(model.get());
     test_quantized(GGML_TYPE_BF16, N_EMBD, N_FF, 2e-2);
     test_quantized(GGML_TYPE_Q8_0, N_EMBD, 64, 2e-2);
     test_quantized(GGML_TYPE_Q4_0, N_EMBD, 64, 2e-2);
