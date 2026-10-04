@@ -253,6 +253,13 @@ class Glm4VVisionModel(Qwen3VLVisionModel):
 @ModelBase.example("Qwen/Qwen3-VL-4B-Instruct")
 class Qwen3VLTextModel(Qwen3Model):
     model_arch = gguf.MODEL_ARCH.QWEN3VL
+    # the vision-language reranker renders its chat template with the parts
+    # concatenated, no spaces after the tags and no reasoning block
+    rerank_template = (
+        "<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n"
+        "<|im_start|>user\n<Instruct>: Given a search query, retrieve relevant candidates that answer the query.<Query>:{query}\n<Document>:{document}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
