@@ -6,14 +6,19 @@ ggml_tensor * clip_graph_qwen2vl::build_inp_with_temporal_merge() {
     GGML_ASSERT(img.nx() % (patch_size * 2) == 0);
     GGML_ASSERT(img.ny() % (patch_size * 2) == 0);
 
+    // the patch convolution runs in F32, so the pixels are not rounded to
+    // half precision on their way in
+    ggml_tensor * kernel_0 = ggml_cast(ctx0, model.patch_embeddings_0, GGML_TYPE_F32);
+    ggml_tensor * kernel_1 = ggml_cast(ctx0, model.patch_embeddings_1, GGML_TYPE_F32);
+
     const size_t nb1 = ggml_row_size(inp_raw->type, img.nx());
     const size_t nb2 = ggml_row_size(inp_raw->type, img.nx() * img.ny());
 
     if (n_batch == 1) {
         // still image input
         return ggml_add(ctx0,
-            ggml_conv_2d(ctx0, model.patch_embeddings_0, inp_raw, patch_size, patch_size, 0, 0, 1, 1),
-            ggml_conv_2d(ctx0, model.patch_embeddings_1, inp_raw, patch_size, patch_size, 0, 0, 1, 1));
+            ggml_conv_2d(ctx0, kernel_0, inp_raw, patch_size, patch_size, 0, 0, 1, 1),
+            ggml_conv_2d(ctx0, kernel_1, inp_raw, patch_size, patch_size, 0, 0, 1, 1));
     } else if (n_batch == 2) {
         // 2 frames input (video input)
         ggml_tensor * inp_0 = ggml_view_3d(ctx0, inp_raw,
@@ -22,8 +27,8 @@ ggml_tensor * clip_graph_qwen2vl::build_inp_with_temporal_merge() {
                                     img.nx(), img.ny(), 3, nb1, nb2,
                                     nb2 * 3); // move to the second frame
         return ggml_add(ctx0,
-            ggml_conv_2d(ctx0, model.patch_embeddings_0, inp_0, patch_size, patch_size, 0, 0, 1, 1),
-            ggml_conv_2d(ctx0, model.patch_embeddings_1, inp_1, patch_size, patch_size, 0, 0, 1, 1));
+            ggml_conv_2d(ctx0, kernel_0, inp_0, patch_size, patch_size, 0, 0, 1, 1),
+            ggml_conv_2d(ctx0, kernel_1, inp_1, patch_size, patch_size, 0, 0, 1, 1));
     } else {
         GGML_ASSERT(false && "n_batch > 2 is not supported");
     }
