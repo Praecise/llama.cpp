@@ -2405,7 +2405,9 @@ mtmd_decoder_pos mtmd_image_tokens_get_decoder_pos(const mtmd_image_tokens * ima
                 pos.t = pos_0;
                 pos.x = pos_0 + (i % image_tokens->nx);
                 pos.y = pos_0 + (i / image_tokens->nx);
-                pos.z = 0; // unused for now
+                // interleaved M-RoPE rotates its last pairs by the fourth
+                // position, which the checkpoints set to the temporal one
+                pos.z = pos_0;
             } break;
         case MTMD_POS_TYPE_NORMAL:
             {
