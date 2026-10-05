@@ -7236,14 +7236,15 @@ struct test_flash_attn_ext : public test_case {
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
+    const float label_weight; // labels of a row add up to this
 
     std::string vars() override {
-        return VARS_TO_STR2(type, ne);
+        return VARS_TO_STR3(type, ne, label_weight);
     }
 
     test_cross_entropy_loss(ggml_type type = GGML_TYPE_F32,
-            std::array<int64_t, 4> ne = {10, 5, 4, 3})
-        : type(type), ne(ne) {}
+            std::array<int64_t, 4> ne = {10, 5, 4, 3}, float label_weight = 1.0f)
+        : type(type), ne(ne), label_weight(label_weight) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * logits = ggml_new_tensor(ctx, type, 4, ne.data());
@@ -7254,8 +7255,11 @@ struct test_cross_entropy_loss : public test_case {
         // The labels are assumed to be constant -> no gradients.
         ggml_set_name(labels, "labels");
 
-        // Ensure labels add up to 1:
+        // Ensure labels add up to label_weight:
         labels = ggml_soft_max(ctx, labels);
+        if (label_weight != 1.0f) {
+            labels = ggml_scale(ctx, labels, label_weight);
+        }
         ggml_set_name(labels, "labels_normalized");
 
         ggml_tensor * out = ggml_cross_entropy_loss(ctx, logits, labels);
@@ -7285,13 +7289,15 @@ struct test_cross_entropy_loss_back : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
 
+    const float label_weight; // labels of a row add up to this
+
     std::string vars() override {
-        return VARS_TO_STR2(type, ne);
+        return VARS_TO_STR3(type, ne, label_weight);
     }
 
     test_cross_entropy_loss_back(ggml_type type = GGML_TYPE_F32,
-            std::array<int64_t, 4> ne = {10, 5, 4, 3})
-        : type(type), ne(ne) {}
+            std::array<int64_t, 4> ne = {10, 5, 4, 3}, float label_weight = 1.0f)
+        : type(type), ne(ne), label_weight(label_weight) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * grad = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
@@ -7303,8 +7309,11 @@ struct test_cross_entropy_loss_back : public test_case {
         ggml_tensor * labels = ggml_new_tensor(ctx, type, 4, ne.data());
         ggml_set_name(labels, "labels");
 
-        // Ensure labels add up to 1:
+        // Ensure labels add up to label_weight:
         labels = ggml_soft_max(ctx, labels);
+        if (label_weight != 1.0f) {
+            labels = ggml_scale(ctx, labels, label_weight);
+        }
         ggml_set_name(labels, "labels_normalized");
 
         ggml_tensor * out = ggml_cross_entropy_loss_back(ctx, grad, logits, labels);
@@ -10681,8 +10690,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
+    test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}, 0.5f));
+    test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}, 0.0f));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {30000, 1, 1, 1}));
+    test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}, 0.5f));
 
     test_cases.emplace_back(new test_opt_step_adamw(GGML_TYPE_F32, {10, 5, 4, 3}));
 

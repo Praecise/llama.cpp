@@ -82,7 +82,14 @@ static __global__ void cross_entropy_loss_back_f32(
         }
     }
     sum = warp_reduce_sum(sum);
-    const float sm_scale = 1.0f/sum;
+
+    // labels need not sum to 1 per row: weighted or masked rows scale the softmax term too
+    float label_sum = 0.0f;
+    for (int i = threadIdx.x; i < nclasses; i += WARP_SIZE) {
+        label_sum += labels[i];
+    }
+    label_sum = warp_reduce_sum(label_sum);
+    const float sm_scale = label_sum/sum;
 
     const float d_by_nrows = *grad/gridDim.x;
     for (int i = threadIdx.x; i < nclasses; i += WARP_SIZE) {

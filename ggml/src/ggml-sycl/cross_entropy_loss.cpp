@@ -88,7 +88,14 @@ static __dpct_inline__ void cross_entropy_loss_back_f32_kernel(
         }
     }
     sum_exp = warp_reduce_sum<WARP_SIZE>(sum_exp);
-    const float inv_sum = 1.0f / sum_exp;
+
+    // labels need not sum to 1 per row: weighted or masked rows scale the softmax term too
+    float label_sum = 0.0f;
+    for (int i = tid; i < nclasses; i += WARP_SIZE) {
+        label_sum += labels[i];
+    }
+    label_sum = warp_reduce_sum<WARP_SIZE>(label_sum);
+    const float inv_sum = label_sum / sum_exp;
 
     const float d_by_nrows = grad[0] / (float) nrows;
     for (int i = tid; i < nclasses; i += WARP_SIZE) {

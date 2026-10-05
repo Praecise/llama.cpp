@@ -11890,7 +11890,11 @@ static void ggml_compute_forward_cross_entropy_loss_back_f32(
         assert(sum > 0.0);
         ggml_vec_scale_f32(nc, ds0, 1.0/sum);
 
-        // grad(src0f) = (softmax(src0f) - src1f) * grad(cross_entropy_loss(src0f, src1f)) / nr
+        // grad(src0f) = (softmax(src0f) * sum(src1f) - src1f) * grad(cross_entropy_loss(src0f, src1f)) / nr
+        // labels need not sum to 1 per row: weighted or masked rows scale the softmax term too
+        float sum_s1 = 0.0f;
+        ggml_vec_sum_f32(nc, &sum_s1, s1);
+        ggml_vec_scale_f32(nc, ds0, sum_s1);
         ggml_vec_sub_f32(nc, ds0, ds0, s1);
         ggml_vec_scale_f32(nc, ds0, d_by_nr);
 

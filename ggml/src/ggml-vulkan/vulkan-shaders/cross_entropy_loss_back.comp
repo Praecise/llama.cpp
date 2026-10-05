@@ -68,8 +68,15 @@ void main() {
     }
     const FLOAT_TYPE inv_sum = FLOAT_TYPE(1.0f) / wg_reduce_sum(sum_exp);
 
+    // labels need not sum to 1 per row: weighted or masked rows scale the softmax term too
+    FLOAT_TYPE label_sum = FLOAT_TYPE(0.0f);
     for (uint i = tid; i < p.KX; i += BLOCK_SIZE) {
-        const FLOAT_TYPE sm = exp(FLOAT_TYPE(data_x[off + i]) - max_logit) * inv_sum;
+        label_sum += FLOAT_TYPE(data_y[off + i]);
+    }
+    label_sum = wg_reduce_sum(label_sum);
+
+    for (uint i = tid; i < p.KX; i += BLOCK_SIZE) {
+        const FLOAT_TYPE sm = exp(FLOAT_TYPE(data_x[off + i]) - max_logit) * inv_sum * label_sum;
         data_d[off + i] = D_TYPE((sm - FLOAT_TYPE(data_y[off + i])) * d_by_nrows);
     }
 }

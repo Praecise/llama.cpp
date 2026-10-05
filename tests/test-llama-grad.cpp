@@ -90,6 +90,30 @@ static gguf_context_ptr model_metadata(uint32_t n_embd = N_EMBD, uint32_t n_ff =
     return ret;
 }
 
+// a dense model with per-head q/k norms, NEOX rotary embeddings, grouped-query heads and
+// a head size that differs from n_embd/n_head
+static gguf_context_ptr qk_norm_metadata() {
+    const uint32_t n_head    = 4;
+    const uint32_t head_size = 16;
+    gguf_context_ptr ret(gguf_init_empty());
+    llama_model_saver ms(LLM_ARCH_QWEN3, ret.get());
+    ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE,         llm_arch_name(LLM_ARCH_QWEN3));
+    ms.add_kv(LLM_KV_VOCAB_SIZE,                   N_VOCAB);
+    ms.add_kv(LLM_KV_CONTEXT_LENGTH,               N_CTX);
+    ms.add_kv(LLM_KV_EMBEDDING_LENGTH,             N_EMBD);
+    ms.add_kv(LLM_KV_BLOCK_COUNT,                  N_LAYER);
+    ms.add_kv(LLM_KV_FEED_FORWARD_LENGTH,          N_FF);
+    ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT,         n_head);
+    ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV,      uint32_t(2));
+    ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,         head_size);
+    ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,       head_size);
+    ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,  1e-6f);
+    ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,         head_size);
+    ms.add_kv(LLM_KV_ROPE_FREQ_BASE,               10000.0f);
+    ms.add_kv(LLM_KV_TOKENIZER_MODEL,              "no_vocab");
+    return ret;
+}
+
 static bool select_all(const struct ggml_tensor * tensor, void * userdata) {
     GGML_UNUSED(tensor);
     GGML_UNUSED(userdata);
@@ -145,7 +169,12 @@ static void check(bool ok, const char * what) {
     n_fail += ok ? 0 : 1;
 }
 
-static void test_fd(llama_model * model, bool flash_attn) {
+static const std::vector<const char *> FD_TENSORS = {
+    "blk.0.attn_q.weight", "blk.0.attn_k.weight", "blk.0.attn_v.weight", "blk.1.attn_output.weight",
+    "blk.1.ffn_up.weight", "blk.0.attn_norm.weight", "output.weight",
+};
+
+static void test_fd(llama_model * model, bool flash_attn, const std::vector<const char *> & names = FD_TENSORS) {
     printf("finite differences, flash attention %s\n", flash_attn ? "on" : "off");
     llama_context_ptr lctx = make_ctx(model, flash_attn, GGML_TYPE_F32, 4);
     GGML_ASSERT(lctx);
@@ -156,9 +185,11 @@ static void test_fd(llama_model * model, bool flash_attn) {
     std::mt19937 gen(7);
     std::vector<llama_token> tokens(n_tokens);
     std::vector<float> targets((size_t) n_tokens*N_VOCAB, 0.0f);
+    // rows weighted as in a batch of several sequences, every fourth row masked out:
+    // the labels of a row need not add up to 1
     for (int i = 0; i < n_tokens; ++i) {
         tokens[i] = gen() % N_VOCAB;
-        targets[(size_t) i*N_VOCAB + gen() % N_VOCAB] = 1.0f;
+        targets[(size_t) i*N_VOCAB + gen() % N_VOCAB] = i % 4 == 3 ? 0.0f : 0.5f;
     }
     std::vector<float> logits((size_t) n_tokens*N_VOCAB);
 
@@ -176,10 +207,6 @@ static void test_fd(llama_model * model, bool flash_attn) {
               llama_opt_grad_op(lctx.get(), -1) == nullptr, "graph op list");
     }
 
-    const char * names[] = {
-        "blk.0.attn_q.weight", "blk.0.attn_k.weight", "blk.0.attn_v.weight", "blk.1.attn_output.weight",
-        "blk.1.ffn_up.weight", "blk.0.attn_norm.weight", "output.weight",
-    };
     for (const char * name : names) {
         ggml_tensor * w = llama_model_get_tensor(model, name);
         GGML_ASSERT(w);
@@ -516,6 +543,18 @@ int main(void) {
     test_quantized(GGML_TYPE_Q8_0, N_EMBD, 64, 2e-2);
     test_quantized(GGML_TYPE_Q4_0, N_EMBD, 64, 2e-2);
     test_quantized(GGML_TYPE_Q4_K, 256, 256, 2e-2);
+
+    {
+        printf("per-head q/k norms, NEOX rotary embeddings\n");
+        gguf_context_ptr meta_qk = qk_norm_metadata();
+        llama_model_ptr model_qk(llama_model_init_from_user(meta_qk.get(), set_tensor_data, &seed, mp));
+        GGML_ASSERT(model_qk);
+        const std::vector<const char *> names = {
+            "blk.0.attn_q.weight", "blk.0.attn_k.weight", "blk.0.attn_v.weight", "blk.0.attn_q_norm.weight",
+            "blk.0.attn_k_norm.weight", "blk.0.attn_norm.weight", "output.weight",
+        };
+        test_fd(model_qk.get(), false, names);
+    }
 
     llama_backend_free();
     printf("%s\n", n_fail == 0 ? "PASSED" : "FAILED");
