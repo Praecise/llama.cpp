@@ -305,6 +305,10 @@ template <typename T, typename U> T load(const U *);
 template <> inline float32x4_t load(const float *p) {
     return vld1q_f32(p);
 }
+// bf16 is the high half of an f32, so widening is a 16-bit left shift (exact).
+template <> inline float32x4_t load(const ggml_bf16_t *p) {
+    return vreinterpretq_f32_u32(vshll_n_u16(vld1_u16((const uint16_t *)p), 16));
+}
 #if !defined(_MSC_VER)
 // FIXME: this should check for __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
 template <> inline float16x8_t load(const ggml_fp16_t *p) {
@@ -3949,6 +3953,16 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
                     (float *)C, ldc};
             #endif
                 return tb.matmul(m, n);
+        }
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_FMA)
+        if (Btype == GGML_TYPE_BF16) {
+            if (n < 4)
+                return false;
+            tinyBLAS<4, float32x4_t, float32x4_t, ggml_bf16_t, ggml_bf16_t, float> tb{ params, k,
+                (const ggml_bf16_t *)A, lda,
+                (const ggml_bf16_t *)B, ldb,
+                (float *)C, ldc};
+            return tb.matmul(m, n);
         }
 #endif
         return false;

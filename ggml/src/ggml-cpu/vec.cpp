@@ -236,6 +236,21 @@ void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * 
     vfloat32m1_t redsum = __riscv_vfredusum_vs_f32m4_f32m1(vsum0, __riscv_vfmv_v_f_f32m1(0.0f, 1), vl);
     sumf += __riscv_vfmv_f_s_f32m1_f32(redsum);
 
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_FMA)
+    // Widen bf16 to f32 with a shift (exact) and accumulate in f32 lanes.
+#define LOAD(p) vreinterpretq_f32_u32(vshll_n_u16(vld1_u16((const uint16_t *)(p)), 16))
+    float32x4_t c1 = vdupq_n_f32(0.0f);
+    float32x4_t c2 = vdupq_n_f32(0.0f);
+    float32x4_t c3 = vdupq_n_f32(0.0f);
+    float32x4_t c4 = vdupq_n_f32(0.0f);
+    for (; i + 16 <= n; i += 16) {
+        c1 = vfmaq_f32(c1, LOAD(x + i),      LOAD(y + i));
+        c2 = vfmaq_f32(c2, LOAD(x + i + 4),  LOAD(y + i + 4));
+        c3 = vfmaq_f32(c3, LOAD(x + i + 8),  LOAD(y + i + 8));
+        c4 = vfmaq_f32(c4, LOAD(x + i + 12), LOAD(y + i + 12));
+    }
+    sumf += (ggml_float)vaddvq_f32(vaddq_f32(vaddq_f32(c1, c3), vaddq_f32(c2, c4)));
+#undef LOAD
 #elif defined(__POWER9_VECTOR__) || defined(__VXE__) || defined(__VXE2__)
     const int np = (n & ~(GGML_BF16_STEP - 1));
     if (np > 0) {
