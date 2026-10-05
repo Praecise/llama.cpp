@@ -1640,6 +1640,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
 
+    if (batch_inp.token && !model.hparams.stage_has_input()) {
+        LLAMA_LOG_ERROR("%s: this layer stage takes hidden states (llama_batch.embd), not tokens\n", __func__);
+        return -1;
+    }
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);

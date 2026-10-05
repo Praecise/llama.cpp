@@ -67,7 +67,7 @@ static bool can_reuse_kq_mask(
 // impl
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
-    if (ubatch->token) {
+    if (ubatch->token && tokens) {
         const int64_t n_tokens = ubatch->n_tokens;
 
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
@@ -2326,8 +2326,9 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
 
     if (tok_embd == nullptr) {
         // a layer stage after the first takes the previous stage's hidden states
+        // the worst-case graph reserved at context creation is built from a token batch;
+        // decode() refuses real token batches for such a stage, so only the topology matters
         GGML_ASSERT(!hparams.stage_has_input() && "model has no token embedding");
-        GGML_ASSERT(ubatch.token == nullptr && "this layer stage takes hidden states (llama_batch.embd), not tokens");
 
         ggml_tensor * cur = inp->embd;
         if (n_embd_inp != n_embd) {
