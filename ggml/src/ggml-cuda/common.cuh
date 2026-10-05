@@ -251,18 +251,25 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
 // initialises. ggml_cuda_driver() returns nullptr, after logging why, when the driver library or
 // one of these entry points is unavailable; the backend then reports no devices.
 #define GGML_CUDA_DRIVER_RUNTIME
+#define GGML_CUDA_DRIVER_FUNCS(X)          \
+    X(cuGetErrorString)                    \
+    X(cuDeviceGet)                         \
+    X(cuDeviceGetAttribute)                \
+    X(cuMemGetAllocationGranularity)       \
+    X(cuMemCreate)                         \
+    X(cuMemRelease)                        \
+    X(cuMemAddressReserve)                 \
+    X(cuMemAddressFree)                    \
+    X(cuMemMap)                            \
+    X(cuMemUnmap)                          \
+    X(cuMemSetAccess)
+#define GGML_CUDA_DRIVER_TYPE(fn) using ggml_cuda_driver_##fn##_t = decltype(&fn);
+GGML_CUDA_DRIVER_FUNCS(GGML_CUDA_DRIVER_TYPE)
+#undef GGML_CUDA_DRIVER_TYPE
 struct ggml_cuda_driver_api {
-    decltype(&cuGetErrorString)              cuGetErrorString;
-    decltype(&cuDeviceGet)                   cuDeviceGet;
-    decltype(&cuDeviceGetAttribute)          cuDeviceGetAttribute;
-    decltype(&cuMemGetAllocationGranularity) cuMemGetAllocationGranularity;
-    decltype(&cuMemCreate)                   cuMemCreate;
-    decltype(&cuMemRelease)                  cuMemRelease;
-    decltype(&cuMemAddressReserve)           cuMemAddressReserve;
-    decltype(&cuMemAddressFree)              cuMemAddressFree;
-    decltype(&cuMemMap)                      cuMemMap;
-    decltype(&cuMemUnmap)                    cuMemUnmap;
-    decltype(&cuMemSetAccess)                cuMemSetAccess;
+#define GGML_CUDA_DRIVER_MEMBER(fn) ggml_cuda_driver_##fn##_t fn;
+    GGML_CUDA_DRIVER_FUNCS(GGML_CUDA_DRIVER_MEMBER)
+#undef GGML_CUDA_DRIVER_MEMBER
 };
 const ggml_cuda_driver_api * ggml_cuda_driver();
 #define GGML_CU(fn) (ggml_cuda_driver()->fn)

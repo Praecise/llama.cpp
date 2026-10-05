@@ -245,7 +245,7 @@ const ggml_cuda_driver_api * ggml_cuda_driver() {
         auto sym = [&](const char * name) { return dlsym(lib, name); };
 #endif
         if (lib == nullptr) {
-            GGML_LOG_ERROR("%s: the CUDA driver library %s could not be loaded\n", __func__, lib_name);
+            GGML_LOG_ERROR("ggml_cuda_driver: the CUDA driver library %s could not be loaded\n", lib_name);
             return nullptr;
         }
         // the library stays loaded for the life of the process
@@ -254,21 +254,11 @@ const ggml_cuda_driver_api * ggml_cuda_driver() {
 #define GGML_CUDA_DRIVER_SYM(fn)                                                                    \
         drv.fn = reinterpret_cast<decltype(drv.fn)>(sym(GGML_CUDA_STR(fn)));                        \
         if (drv.fn == nullptr) {                                                                    \
-            GGML_LOG_ERROR("%s: the CUDA driver library %s has no entry point %s\n",              \
-                           __func__, lib_name, GGML_CUDA_STR(fn));                                  \
+            GGML_LOG_ERROR("ggml_cuda_driver: the CUDA driver library %s has no entry point %s\n", \
+                           lib_name, GGML_CUDA_STR(fn));                                            \
             complete = false;                                                                       \
         }
-        GGML_CUDA_DRIVER_SYM(cuGetErrorString)
-        GGML_CUDA_DRIVER_SYM(cuDeviceGet)
-        GGML_CUDA_DRIVER_SYM(cuDeviceGetAttribute)
-        GGML_CUDA_DRIVER_SYM(cuMemGetAllocationGranularity)
-        GGML_CUDA_DRIVER_SYM(cuMemCreate)
-        GGML_CUDA_DRIVER_SYM(cuMemRelease)
-        GGML_CUDA_DRIVER_SYM(cuMemAddressReserve)
-        GGML_CUDA_DRIVER_SYM(cuMemAddressFree)
-        GGML_CUDA_DRIVER_SYM(cuMemMap)
-        GGML_CUDA_DRIVER_SYM(cuMemUnmap)
-        GGML_CUDA_DRIVER_SYM(cuMemSetAccess)
+        GGML_CUDA_DRIVER_FUNCS(GGML_CUDA_DRIVER_SYM)
 #undef GGML_CUDA_DRIVER_SYM
         return complete ? &drv : nullptr;
     }();
