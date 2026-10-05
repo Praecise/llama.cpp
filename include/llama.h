@@ -340,6 +340,15 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // layer-pipeline stage: load only blocks [stage_layer_begin, stage_layer_end).
+        // Both 0 loads the whole model. A stage that does not start at block 0 takes hidden
+        // states as input (llama_batch.embd, n_embd floats per token) and does not load the token
+        // embedding. A stage that does not end at the last block does not load the output head;
+        // its context must enable embeddings with LLAMA_POOLING_TYPE_NONE and it returns the hidden
+        // state after its last block for every output token (llama_get_embeddings_ith).
+        int32_t stage_layer_begin;
+        int32_t stage_layer_end;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data

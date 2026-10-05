@@ -57,6 +57,13 @@ struct llama_hparams {
     uint32_t n_layer_all;
     uint32_t n_layer_nextn = 0;
 
+    // layer-pipeline stage: this model holds blocks [stage_layer_begin, stage_layer_end) of a
+    // model with stage_n_layer_model blocks; per-layer arrays and n_layer_all are stage-local.
+    // stage_n_layer_model == 0 means the whole model is loaded.
+    uint32_t stage_layer_begin   = 0;
+    uint32_t stage_layer_end     = 0;
+    uint32_t stage_n_layer_model = 0;
+
     // granite-switch: index of the single-head "router" KV layer that encodes
     // per-token adapter selection. -1 when the model has no such layer.
     int32_t  router_layer = -1;
@@ -430,6 +437,13 @@ struct llama_hparams {
 
     // number of effective layers (excludes nextn layers)
     uint32_t n_layer() const;
+
+    // true when only a slice of the blocks is loaded
+    bool is_stage() const;
+    // the stage holds the token embedding (takes tokens as input)
+    bool stage_has_input() const;
+    // the stage holds the output head (produces logits)
+    bool stage_has_output() const;
 
     // note that this function uses different SWA parameters from those in the hparams
     // note: inlined on purpose for performance reasons

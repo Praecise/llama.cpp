@@ -1512,6 +1512,13 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
+    if (w == nullptr) {
+        // the output head of a layer stage that does not hold it; the stage returns the
+        // residual stream instead (see llama_model::build_graph)
+        GGML_ASSERT(!hparams.stage_has_output() && "missing weight");
+        return cur;
+    }
+
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
 
     if (w_s) {
@@ -2313,14 +2320,30 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
 
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
+    cb(inp->embd, "inp_embd", -1);
+    ggml_set_input(inp->embd);
+
+    if (tok_embd == nullptr) {
+        // a layer stage after the first takes the previous stage's hidden states
+        GGML_ASSERT(!hparams.stage_has_input() && "model has no token embedding");
+        GGML_ASSERT(ubatch.token == nullptr && "this layer stage takes hidden states (llama_batch.embd), not tokens");
+
+        ggml_tensor * cur = inp->embd;
+        if (n_embd_inp != n_embd) {
+            cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[1], 0);
+        }
+        res->t_inp_embd = cur;
+        cb(cur, "embd", -1);
+        res->add_input(std::move(inp));
+        ggml_build_forward_expand(gf, cur);
+        return cur;
+    }
+
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
     cb(inp->tokens, "inp_tokens", -1);
     ggml_set_input(inp->tokens);
     res->t_inp_tokens = inp->tokens;
-
-    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
-    cb(inp->embd, "inp_embd", -1);
-    ggml_set_input(inp->embd);
 
     // select one of the 2 inputs, based on the batch contents
     // ref: https://github.com/ggml-org/llama.cpp/pull/18550

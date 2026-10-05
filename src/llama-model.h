@@ -807,6 +807,9 @@ struct llama_model_base : public llama_model {
 
     void load_stats  (llama_model_loader & ml) override;
     void load_hparams(llama_model_loader & ml) override;
+
+    // restrict the model to the layer stage named in params
+    void apply_stage(llama_model_loader & ml);
     void load_vocab  (llama_model_loader & ml) override;
     bool load_tensors(llama_model_loader & ml) override;
 

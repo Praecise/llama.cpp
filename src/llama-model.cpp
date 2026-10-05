@@ -1354,6 +1354,10 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     // per-arch hparams
     load_arch_hparams(ml);
 
+    if (params.stage_layer_begin != 0 || params.stage_layer_end != 0) {
+        apply_stage(ml);
+    }
+
     pimpl->n_bytes = ml.n_bytes;
 
     pimpl->desc_str = arch_name() + " " + type_name() + " " + ml.ftype_name();
@@ -1365,6 +1369,77 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     }
 
     hparams.rope_type = llama_model_rope_type(this);
+}
+
+// architectures whose graph depends on the block index only through the per-layer hparams
+// arrays, read nothing but the residual stream between blocks, and name the output of every
+// block "l_out-<il>"; these can be split into layer-pipeline stages
+static bool llm_arch_supports_stages(llm_arch arch) {
+    switch (arch) {
+        case LLM_ARCH_LLAMA:
+        case LLM_ARCH_QWEN2:
+        case LLM_ARCH_QWEN3:
+        case LLM_ARCH_QWEN3MOE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+void llama_model_base::apply_stage(llama_model_loader & ml) {
+    const int32_t begin   = params.stage_layer_begin;
+    const int32_t end     = params.stage_layer_end;
+    const int32_t n_model = (int32_t) hparams.n_layer();
+
+    if (!llm_arch_supports_stages(arch)) {
+        throw std::runtime_error(format("architecture %s cannot be split into layer stages", llm_arch_name(arch)));
+    }
+    if (hparams.n_layer_nextn > 0) {
+        throw std::runtime_error("a model with nextn layers cannot be split into layer stages");
+    }
+    if (begin < 0 || end <= begin || end > n_model) {
+        throw std::runtime_error(format("invalid layer stage [%d, %d) for a model with %d blocks", begin, end, n_model));
+    }
+
+    auto shift = [&](auto & arr) {
+        std::copy(arr.begin() + begin, arr.begin() + end, arr.begin());
+    };
+    shift(hparams.n_head_arr);
+    shift(hparams.n_head_kv_arr);
+    shift(hparams.n_ff_arr);
+    shift(hparams.rope_pattern);
+    shift(hparams.is_swa_impl);
+    shift(hparams.is_recr_impl);
+    shift(hparams.xielu_alpha_n);
+    shift(hparams.xielu_alpha_p);
+    shift(hparams.xielu_beta);
+    shift(hparams.xielu_eps);
+    shift(hparams.is_indexer_full_impl);
+    shift(hparams.dsv4_compress_ratios);
+    shift(hparams.is_ple_impl);
+    shift(hparams.deepstack_mapping_arr);
+    shift(hparams.swiglu_clamp_exp);
+    shift(hparams.swiglu_clamp_shexp);
+
+    hparams.stage_layer_begin   = begin;
+    hparams.stage_layer_end     = end;
+    hparams.stage_n_layer_model = n_model;
+    hparams.n_layer_all         = end - begin;
+
+    // the blocks outside the stage are present in the file but never created
+    for (const auto & it : ml.weights_map) {
+        int il = -1;
+        if (sscanf(it.first.c_str(), "blk.%d.", &il) != 1) {
+            continue;
+        }
+        if (il < begin || il >= end) {
+            ml.n_created++;
+            ml.size_data -= ggml_nbytes(it.second.tensor);
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: layer stage [%d, %d) of %d blocks (input: %s, output: %s)\n", __func__,
+            begin, end, n_model, hparams.stage_has_input() ? "tokens" : "hidden", hparams.stage_has_output() ? "logits" : "hidden");
 }
 
 void llama_model_base::load_vocab(llama_model_loader & ml) {
@@ -1804,6 +1879,30 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
+    if (hparams.is_stage()) {
+        if (tn.bid == -1) {
+            // the token embedding belongs to the first stage and the output head to the last;
+            // a tied output head is the token embedding loaded as a duplicate
+            const bool is_input  = tn.tensor == LLM_TENSOR_TOKEN_EMBD && !(flags & TENSOR_DUPLICATED);
+            const bool is_output = tn.tensor == LLM_TENSOR_OUTPUT || tn.tensor == LLM_TENSOR_OUTPUT_NORM ||
+                                   (tn.tensor == LLM_TENSOR_TOKEN_EMBD && (flags & TENSOR_DUPLICATED));
+            if ((is_input && !hparams.stage_has_input()) || (is_output && !hparams.stage_has_output())) {
+                const std::string name = tn.str();
+                const auto * w = ml.get_weight(name.c_str());
+                if (w != nullptr && !(flags & TENSOR_DUPLICATED)) {
+                    ml.n_created++;
+                    ml.size_data -= ggml_nbytes(w->tensor);
+                }
+                return nullptr;
+            }
+        } else {
+            // per-layer tensors are named by their block index in the full model
+            const LLM_TN_IMPL tn_model(tn.arch, tn.tensor, tn.suffix, tn.bid + (int) hparams.stage_layer_begin, tn.xid);
+            return ml.create_tensor(
+                hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
+                tn_model, ne, flags);
+        }
+    }
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
@@ -2632,6 +2731,25 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
 
+    if (!hparams.stage_has_output()) {
+        // a stage without the output head returns the residual stream after its last block
+        const std::string name = "l_out-" + std::to_string(hparams.n_layer() - 1);
+        ggml_cgraph * gf = llm->res->get_gf();
+        ggml_tensor * hidden = nullptr;
+        for (int i = ggml_graph_n_nodes(gf) - 1; i >= 0; --i) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            if (name == ggml_get_name(node)) {
+                hidden = node;
+                break;
+            }
+        }
+        if (hidden == nullptr) {
+            throw std::runtime_error(format("layer stage graph has no node %s", name.c_str()));
+        }
+        llm->res->t_logits = nullptr;
+        llm->res->t_embd   = hidden;
+    }
+
     // add on pooling layer
     llm->build_pooling(cls, cls_b, cls_out, cls_out_b, cls_norm);
 
@@ -2667,6 +2785,8 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.stage_layer_begin           =*/ 0,
+        /*.stage_layer_end             =*/ 0,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,

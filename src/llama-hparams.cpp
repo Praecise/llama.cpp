@@ -324,6 +324,18 @@ uint32_t llama_hparams::n_layer() const {
     return n_layer_all - n_layer_nextn;
 }
 
+bool llama_hparams::is_stage() const {
+    return stage_n_layer_model > 0;
+}
+
+bool llama_hparams::stage_has_input() const {
+    return !is_stage() || stage_layer_begin == 0;
+}
+
+bool llama_hparams::stage_has_output() const {
+    return !is_stage() || stage_layer_end == stage_n_layer_model;
+}
+
 bool llama_hparams::use_mrope() const {
     return rope_sections[0] > 0 && rope_sections[1] > 0;
 }
