@@ -23,4 +23,3 @@ set( CUDA_CUDART              "${CUDA_ROOT}/lib/arm64/cudart.lib"   CACHE FILEPA
 set( CUDA_cudart_LIBRARY      "${CUDA_ROOT}/lib/arm64/cudart.lib"   CACHE FILEPATH "" )
 set( CUDA_cublas_LIBRARY      "${CUDA_ROOT}/lib/arm64/cublas.lib"   CACHE FILEPATH "" )
 set( CUDA_cublasLt_LIBRARY    "${CUDA_ROOT}/lib/arm64/cublasLt.lib" CACHE FILEPATH "" )
-set( CUDA_cuda_driver_LIBRARY "${CUDA_ROOT}/lib/arm64/cuda.lib"     CACHE FILEPATH "" )

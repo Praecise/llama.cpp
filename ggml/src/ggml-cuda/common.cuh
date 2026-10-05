@@ -218,15 +218,6 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
 #define NCCL_CHECK(err) CUDA_CHECK_GEN(err, ncclSuccess, ncclGetErrorString)
 #endif // GGML_USE_NCCL
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_CUDA_NO_VMM)
-static const char * cu_get_error_str(CUresult err) {
-    const char * err_str;
-    cuGetErrorString(err, &err_str);
-    return err_str;
-}
-#define CU_CHECK(err) CUDA_CHECK_GEN(err, CUDA_SUCCESS, cu_get_error_str)
-#endif
-
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #    define CUDA_SET_SHARED_MEMORY_LIMIT(kernel, nbytes)                                                       \
         do {                                                                                                   \
@@ -253,6 +244,40 @@ static const char * cu_get_error_str(CUresult err) {
 #if (!defined(GGML_USE_HIP) && !defined(GGML_CUDA_NO_VMM)) || (defined(GGML_USE_HIP) && !defined(GGML_HIP_NO_VMM))
 #define GGML_USE_VMM
 #endif // (!defined(GGML_USE_HIP) && !defined(GGML_CUDA_NO_VMM)) || (defined(GGML_USE_HIP) && !defined(GGML_HIP_NO_VMM))
+
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// The CUDA driver library is not linked, so a CUDA build still loads on a host without the driver.
+// The driver entry points used by the virtual memory pool are resolved once, when the backend
+// initialises. ggml_cuda_driver() returns nullptr, after logging why, when the driver library or
+// one of these entry points is unavailable; the backend then reports no devices.
+#define GGML_CUDA_DRIVER_RUNTIME
+struct ggml_cuda_driver_api {
+    decltype(&cuGetErrorString)              cuGetErrorString;
+    decltype(&cuDeviceGet)                   cuDeviceGet;
+    decltype(&cuDeviceGetAttribute)          cuDeviceGetAttribute;
+    decltype(&cuMemGetAllocationGranularity) cuMemGetAllocationGranularity;
+    decltype(&cuMemCreate)                   cuMemCreate;
+    decltype(&cuMemRelease)                  cuMemRelease;
+    decltype(&cuMemAddressReserve)           cuMemAddressReserve;
+    decltype(&cuMemAddressFree)              cuMemAddressFree;
+    decltype(&cuMemMap)                      cuMemMap;
+    decltype(&cuMemUnmap)                    cuMemUnmap;
+    decltype(&cuMemSetAccess)                cuMemSetAccess;
+};
+const ggml_cuda_driver_api * ggml_cuda_driver();
+#define GGML_CU(fn) (ggml_cuda_driver()->fn)
+#else
+#define GGML_CU(fn) fn
+#endif // defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_CUDA_NO_VMM)
+static const char * cu_get_error_str(CUresult err) {
+    const char * err_str = "unknown driver error";
+    GGML_CU(cuGetErrorString)(err, &err_str);
+    return err_str;
+}
+#define CU_CHECK(err) CUDA_CHECK_GEN(err, CUDA_SUCCESS, cu_get_error_str)
+#endif
 
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA) || __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL
 #define FP16_AVAILABLE

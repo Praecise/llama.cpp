@@ -1,4 +1,18 @@
 #include "ggml-cuda.h"
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM)
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+#endif
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
@@ -215,6 +229,53 @@ static int ggml_cuda_parse_id(char devName[]) {
 }
 #endif // defined(GGML_USE_HIP)
 
+#if defined(GGML_CUDA_DRIVER_RUNTIME)
+#define GGML_CUDA_STR_(x) #x
+#define GGML_CUDA_STR(x)  GGML_CUDA_STR_(x)
+
+const ggml_cuda_driver_api * ggml_cuda_driver() {
+    static const ggml_cuda_driver_api * const api = []() -> const ggml_cuda_driver_api * {
+#ifdef _WIN32
+        const char * const lib_name = "nvcuda.dll";
+        HMODULE lib = LoadLibraryA(lib_name);
+        auto sym = [&](const char * name) { return reinterpret_cast<void *>(GetProcAddress(lib, name)); };
+#else
+        const char * const lib_name = "libcuda.so.1";
+        void * lib = dlopen(lib_name, RTLD_NOW | RTLD_LOCAL);
+        auto sym = [&](const char * name) { return dlsym(lib, name); };
+#endif
+        if (lib == nullptr) {
+            GGML_LOG_ERROR("%s: the CUDA driver library %s could not be loaded\n", __func__, lib_name);
+            return nullptr;
+        }
+        // the library stays loaded for the life of the process
+        static ggml_cuda_driver_api drv = {};
+        bool complete = true;
+#define GGML_CUDA_DRIVER_SYM(fn)                                                                    \
+        drv.fn = reinterpret_cast<decltype(drv.fn)>(sym(GGML_CUDA_STR(fn)));                        \
+        if (drv.fn == nullptr) {                                                                    \
+            GGML_LOG_ERROR("%s: the CUDA driver library %s has no entry point %s\n",              \
+                           __func__, lib_name, GGML_CUDA_STR(fn));                                  \
+            complete = false;                                                                       \
+        }
+        GGML_CUDA_DRIVER_SYM(cuGetErrorString)
+        GGML_CUDA_DRIVER_SYM(cuDeviceGet)
+        GGML_CUDA_DRIVER_SYM(cuDeviceGetAttribute)
+        GGML_CUDA_DRIVER_SYM(cuMemGetAllocationGranularity)
+        GGML_CUDA_DRIVER_SYM(cuMemCreate)
+        GGML_CUDA_DRIVER_SYM(cuMemRelease)
+        GGML_CUDA_DRIVER_SYM(cuMemAddressReserve)
+        GGML_CUDA_DRIVER_SYM(cuMemAddressFree)
+        GGML_CUDA_DRIVER_SYM(cuMemMap)
+        GGML_CUDA_DRIVER_SYM(cuMemUnmap)
+        GGML_CUDA_DRIVER_SYM(cuMemSetAccess)
+#undef GGML_CUDA_DRIVER_SYM
+        return complete ? &drv : nullptr;
+    }();
+    return api;
+}
+#endif // defined(GGML_CUDA_DRIVER_RUNTIME)
+
 static ggml_cuda_device_info ggml_cuda_init() {
     ggml_cuda_device_info info = {};
 
@@ -223,6 +284,14 @@ static ggml_cuda_device_info ggml_cuda_init() {
         GGML_LOG_ERROR("%s: failed to initialize " GGML_CUDA_NAME ": %s\n", __func__, cudaGetErrorString(err));
         return info;
     }
+
+#if defined(GGML_CUDA_DRIVER_RUNTIME)
+    if (info.physical_device_count > 0 && ggml_cuda_driver() == nullptr) {
+        GGML_LOG_ERROR("%s: failed to initialize " GGML_CUDA_NAME ": the driver entry points are unavailable\n", __func__);
+        info.physical_device_count = 0;
+        return info;
+    }
+#endif // defined(GGML_CUDA_DRIVER_RUNTIME)
 
     GGML_ASSERT(info.physical_device_count <= GGML_CUDA_MAX_DEVICES);
 
@@ -277,15 +346,15 @@ static ggml_cuda_device_info ggml_cuda_init() {
 
 #if defined(GGML_USE_VMM)
         CUdevice device;
-        CU_CHECK(cuDeviceGet(&device, physical_id));
-        CU_CHECK(cuDeviceGetAttribute(&device_vmm, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, device));
+        CU_CHECK(GGML_CU(cuDeviceGet)(&device, physical_id));
+        CU_CHECK(GGML_CU(cuDeviceGetAttribute)(&device_vmm, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, device));
 
         if (device_vmm) {
             CUmemAllocationProp alloc_prop = {};
             alloc_prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
             alloc_prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             alloc_prop.location.id = physical_id;
-            CU_CHECK(cuMemGetAllocationGranularity(&info.devices[id].vmm_granularity, &alloc_prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+            CU_CHECK(GGML_CU(cuMemGetAllocationGranularity)(&info.devices[id].vmm_granularity, &alloc_prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
         }
 #endif // defined(GGML_USE_VMM)
         info.devices[id].vmm = !!device_vmm;
@@ -558,12 +627,12 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 #if defined(GGML_USE_HIP)
             // Workaround for https://github.com/ROCm/ROCR-Runtime/issues/285
             for (std::pair<CUdeviceptr, size_t> & mapping : mappings) {
-                CU_CHECK(cuMemUnmap(mapping.first, mapping.second));
+                CU_CHECK(GGML_CU(cuMemUnmap)(mapping.first, mapping.second));
             }
 #else
-            CU_CHECK(cuMemUnmap(pool_addr, pool_size));
+            CU_CHECK(GGML_CU(cuMemUnmap)(pool_addr, pool_size));
 #endif
-            CU_CHECK(cuMemAddressFree(pool_addr, CUDA_POOL_VMM_MAX_SIZE));
+            CU_CHECK(GGML_CU(cuMemAddressFree)(pool_addr, CUDA_POOL_VMM_MAX_SIZE));
         }
     }
 
@@ -587,22 +656,22 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             prop.location.id = physical_device;
             CUmemGenericAllocationHandle handle;
-            CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
+            CU_CHECK(GGML_CU(cuMemCreate)(&handle, reserve_size, &prop, 0));
 
             // reserve virtual address space (if not already reserved)
             if (pool_addr == 0) {
-                CU_CHECK(cuMemAddressReserve(&pool_addr, CUDA_POOL_VMM_MAX_SIZE, 0, 0, 0));
+                CU_CHECK(GGML_CU(cuMemAddressReserve)(&pool_addr, CUDA_POOL_VMM_MAX_SIZE, 0, 0, 0));
             }
 
             // map at the end of the pool
             CUdeviceptr start_ptr = (CUdeviceptr)((char *)(pool_addr) + pool_size);
-            CU_CHECK(cuMemMap(start_ptr, reserve_size, 0, handle, 0));
+            CU_CHECK(GGML_CU(cuMemMap)(start_ptr, reserve_size, 0, handle, 0));
 #if defined(GGML_USE_HIP)
             mappings.push_back({start_ptr, reserve_size});
 #endif
 
             // the memory allocation handle is no longer needed after mapping
-            CU_CHECK(cuMemRelease(handle));
+            CU_CHECK(GGML_CU(cuMemRelease)(handle));
 
             // VMM Bug fix for P2P access if GGML_CUDA_P2P is set, or if NCCL build
             bool use_peer_access = getenv("GGML_CUDA_P2P") != nullptr;
@@ -639,14 +708,14 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
                     access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
                     access_descs.push_back(access);
                 }
-                CU_CHECK(cuMemSetAccess(start_ptr, reserve_size, access_descs.data(), access_descs.size()));
+                CU_CHECK(GGML_CU(cuMemSetAccess)(start_ptr, reserve_size, access_descs.data(), access_descs.size()));
             } else {
                 // set access for non P2P
                 CUmemAccessDesc access = {};
                 access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
                 access.location.id = physical_device;
                 access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-                CU_CHECK(cuMemSetAccess(start_ptr, reserve_size, &access, 1));
+                CU_CHECK(GGML_CU(cuMemSetAccess)(start_ptr, reserve_size, &access, 1));
             }
 
             // add to the pool

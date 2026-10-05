@@ -176,10 +176,11 @@ if (CUDAToolkit_FOUND)
         target_link_libraries(ggml-cuda PRIVATE CUDA::cudart CUDA::cublas)
     endif()
 
-    if (GGML_CUDA_NO_VMM)
-        # No VMM requested, no need to link directly with the cuda driver lib (libcuda.so)
-    else()
-        target_link_libraries(ggml-cuda PRIVATE CUDA::cuda_driver)
+    # The CUDA driver library is never linked: the driver entry points used by the virtual memory
+    # pool are resolved at runtime (see ggml_cuda_driver), so a CUDA build loads on a host without
+    # the driver and reports that the backend is unavailable.
+    if (NOT GGML_CUDA_NO_VMM AND CMAKE_DL_LIBS)
+        target_link_libraries(ggml-cuda PRIVATE ${CMAKE_DL_LIBS})
     endif()
 
     if (GGML_CUDA_NCCL)
