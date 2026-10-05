@@ -147,7 +147,7 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
                 layer.deepstack_fc1_w, layer.deepstack_fc1_b,
                 nullptr, nullptr,
                 layer.deepstack_fc2_w, layer.deepstack_fc2_b,
-                ffn_op_type::FFN_GELU, il);
+                ffn_op_type::FFN_GELU_ERF, il); // the mergers use the exact GELU
 
             if(!deepstack_features) {
                 deepstack_features = feat;
@@ -173,7 +173,7 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
         model.mm_0_w, model.mm_0_b,
         nullptr, nullptr,
         model.mm_1_w, model.mm_1_b,
-        ffn_op_type::FFN_GELU, -1);
+        ffn_op_type::FFN_GELU_ERF, -1);
 
     if (deepstack_features) {
         embeddings = ggml_concat(ctx0, embeddings, deepstack_features, 0);
