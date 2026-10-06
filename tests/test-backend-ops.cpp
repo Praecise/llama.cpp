@@ -10484,6 +10484,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_pad(GGML_TYPE_F32, {2048, 4, 1, 1}, 1, 0, false));
     test_cases.emplace_back(new test_pad(GGML_TYPE_F32, {2049, 1, 1, 1}, 1, 0, false));
     test_cases.emplace_back(new test_pad(GGML_TYPE_F32, {100, 1, 1, 1}, 100, 0, false));
+    test_cases.emplace_back(new test_pad(GGML_TYPE_F32, {8, 70000, 1, 1}, 1, 3, false)); // more rows than a grid dimension holds
+    test_cases.emplace_back(new test_pad(GGML_TYPE_F32, {8, 70000, 1, 1}, 1, 3, true));
     test_cases.emplace_back(new test_pad(GGML_TYPE_F32, {100, 1, 1, 1}, 0, 100, false));
     test_cases.emplace_back(new test_pad(GGML_TYPE_F32, {100, 100, 1, 1}, 50, 50, false));
 
