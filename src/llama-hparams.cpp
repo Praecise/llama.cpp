@@ -71,6 +71,31 @@ uint32_t llama_hparams::n_ff(uint32_t il) const {
     GGML_ABORT("fatal error");
 }
 
+uint32_t llama_hparams::n_ff_exp(uint32_t il) const {
+    if (il < n_layer_all) {
+        return n_ff_exp_arr[il];
+    }
+
+    GGML_ABORT("fatal error");
+}
+
+uint32_t llama_hparams::n_expert_used(uint32_t il) const {
+    if (il < n_layer_all) {
+        return n_expert_used_arr[il];
+    }
+
+    GGML_ABORT("fatal error");
+}
+
+uint32_t llama_hparams::n_expert_used_max() const {
+    uint32_t val = 0;
+    for (uint32_t il = 0; il < n_layer_all; ++il) {
+        val = std::max(val, n_expert_used(il));
+    }
+
+    return val;
+}
+
 uint32_t llama_hparams::n_gqa(uint32_t il) const {
     const uint32_t n_head    = this->n_head(il);
     const uint32_t n_head_kv = this->n_head_kv(il);
@@ -181,6 +206,11 @@ uint32_t llama_hparams::n_embd_v_gqa_max() const {
 }
 
 uint32_t llama_hparams::n_embd_r() const {
+    if (n_embd_r_impl != 0) {
+        // explicit override (e.g. inkling: 4 packed shortconv streams per layer)
+        return n_embd_r_impl;
+    }
+
     if (wkv_head_size != 0) {
         // for RWKV models
         return token_shift_count * n_embd;
@@ -203,10 +233,9 @@ uint32_t llama_hparams::n_embd_r() const {
     // Corresponds to Mamba's conv_states size
     const uint32_t n_conv = (ssm_d_conv > 0 ? ssm_d_conv - 1 : 0) * (ssm_d_inner + 2*ssm_n_group*ssm_d_state);
 
-    // qwen4exp puts a PLE module on a delta-net layer, so the row carries a second
-    // dilated conv state. Rows are uniform, so every recurrent layer reserves it;
-    // ple_n_heads is 0 elsewhere, leaving n_conv alone.
-    return n_conv + ple_conv_state();
+    // PLE conv history needs its own row: Meta splits cache_r_l by head, so a history packed behind the first is unaddressable
+    // it lives in cache_ple_r_l instead, mirrored like the rest of the PLE module
+    return n_conv;
 }
 
 uint32_t llama_hparams::n_embd_s() const {
@@ -259,7 +288,8 @@ bool llama_hparams::is_ple(uint32_t il) const {
 }
 
 uint32_t llama_hparams::n_pos_per_embd() const {
-    return rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE ? 4 : 1;
+    return (rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE)
+            ? GGML_MROPE_SECTIONS : 1;
 }
 
 bool llama_hparams::is_swa(uint32_t il) const {

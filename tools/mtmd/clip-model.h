@@ -71,6 +71,7 @@ struct clip_hparams {
     std::vector<clip_image_size> image_res_candidates;
     int32_t preproc_min_tiles = 0;
     int32_t preproc_max_tiles = 0;
+    int32_t max_slice_nums = 9; // llava-uhd slice cap; per-model, carried in the GGUF
     int32_t preproc_tile_size = 0; // local tile size (deepseek-ocr)
     resize_algo image_resize_algo_rf = RESIZE_ALGO_BICUBIC;
     resize_algo image_resize_algo_ov = RESIZE_ALGO_BICUBIC;
@@ -93,12 +94,18 @@ struct clip_hparams {
 
     float eps = 1e-6;
     float rope_theta = 0.0;
+
+    float swiglu_clamp = 0.0f;
     int32_t n_expert_used = 0;
     std::vector<int32_t> feature_layers;
     int32_t attn_window_size = 0;
     int32_t n_wa_pattern = 0;
     std::unordered_set<int32_t> wa_layer_indexes; // explicit layer indexes that use full attention (for irregular patterns like YoutuVL)
     std::vector<int32_t> wa_pattern_mode; // mimovl: per-layer window-attention mode
+
+    // deepseek4v: resize solver caps the LLM token count of the aligner grid
+    int32_t dsv4_max_n_token  = 0;
+    int32_t dsv4_max_wh_ratio = 0;
 
     // deepseek-ocr (sam)
     int32_t sam_n_layer = 0;
@@ -204,8 +211,11 @@ struct clip_hparams {
     void set_warmup_n_tokens(int n_tokens) {
         int n_tok_per_side = static_cast<int>(std::sqrt(n_tokens));
         GGML_ASSERT(n_tok_per_side * n_tok_per_side == n_tokens && "n_tokens must be n*n");
+        // do not warmup with more tokens than the max allowed
+        if (custom_image_max_tokens > 0 && n_tokens > custom_image_max_tokens) {
+            n_tok_per_side = std::max(1, static_cast<int>(std::sqrt(custom_image_max_tokens)));
+        }
         warmup_image_size = n_tok_per_side * patch_size * n_merge;
-        // TODO: support warmup size for custom token numbers
     }
     // sam vit deepseek-ocr
     std::vector<int32_t> global_attn_indices() const {
@@ -424,6 +434,11 @@ struct qf_block {
     std::vector<clip_layer> qf_proj_layers;
 };
 
+struct inkling_hmlp_layer {
+    ggml_tensor * linear_w = nullptr;
+    ggml_tensor * norm_w   = nullptr;
+};
+
 // pocket-tts SEANet stack, used in both directions:
 // encoder = conv_in -> per stage (residual unit, strided conv) -> conv_out
 // decoder = conv_in -> per stage (strided convtr, residual unit) -> conv_out
@@ -562,6 +577,12 @@ struct clip_model {
     ggml_tensor * norm_embd_w = nullptr;
     ggml_tensor * norm_embd_b = nullptr;
 
+    // Inkling towers (neither uses standard transformer blocks).
+    std::vector<inkling_hmlp_layer> inkling_hmlp_layers;
+    ggml_tensor * inkling_hmlp_final_norm_w = nullptr;
+    ggml_tensor * inkling_dmel_embd_w        = nullptr;
+    ggml_tensor * inkling_dmel_final_norm_w  = nullptr;
+
     // "indexed" patch embedding norms
     ggml_tensor * patch_norm_1_w = nullptr;
     ggml_tensor * patch_norm_1_b = nullptr;
@@ -605,6 +626,7 @@ struct clip_model {
 
     ggml_tensor * image_newline = nullptr;
     ggml_tensor * view_seperator = nullptr;
+    ggml_tensor * tok_embd_sep = nullptr; // [n_embd_text, n_sep] rows of the text model tok_embd (MiniCPM-V 4.7)
 
 
     // Yi type models with mlp+normalization projection
@@ -614,6 +636,10 @@ struct clip_model {
     ggml_tensor * mm_3_b = nullptr;
     ggml_tensor * mm_4_w = nullptr;
     ggml_tensor * mm_4_b = nullptr;
+    ggml_tensor * mm_5_w = nullptr;
+    ggml_tensor * mm_5_b = nullptr;
+    ggml_tensor * mm_6_w = nullptr;
+    ggml_tensor * mm_6_b = nullptr;
 
     // GLMV-Edge projection
     ggml_tensor * mm_model_adapter_conv_w = nullptr;
@@ -724,6 +750,11 @@ struct clip_model {
 
     // pixtral, glm4v
     ggml_tensor * token_embd_img_break = nullptr;
+
+    // deepseek4v sentinel embeddings (image_newline is reused for IMAGE_NEW_LINE)
+    ggml_tensor * token_embd_img_start = nullptr;
+    ggml_tensor * token_embd_img_end   = nullptr;
+    ggml_tensor * token_embd_img_pad   = nullptr;
     ggml_tensor * mm_patch_merger_w = nullptr;
     ggml_tensor * mm_patch_merger_b = nullptr;
 
