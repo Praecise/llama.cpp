@@ -118,6 +118,10 @@ def parse_args() -> argparse.Namespace:
         help="Export multimodal projector (mmproj) for vision models. This will only work on some vision models. An 'mmproj-' prefix will be added to the output file name.",
     )
     parser.add_argument(
+        "--talker", action="store_true",
+        help="Export the speech-output part of an omni model: the talker backbone, or with --mmproj its code predictor and waveform decoder.",
+    )
+    parser.add_argument(
         "--mtp", action="store_true",
         help="Export only the multi-token prediction (MTP) head as a separate GGUF, suitable for use as a speculative draft. An 'mtp-' prefix will be added to the output file name.",
     )
@@ -261,6 +265,17 @@ def main() -> None:
         else:
             from conversion.mistral import MistralModel
             model_class = MistralModel
+
+        if args.talker:
+            if is_mistral_format:
+                logger.error("--talker is not supported for the Mistral format")
+                sys.exit(1)
+            from conversion.qwen3omni_talker import talker_model_class
+            try:
+                model_class = talker_model_class(model_architecture, mmproj=args.mmproj)
+            except NotImplementedError as e:
+                logger.error(str(e))
+                sys.exit(1)
 
         if sum((args.mtp, args.no_mtp, args.dspark)) > 1:
             logger.error("--mtp, --no-nextn, and --dspark are mutually exclusive")

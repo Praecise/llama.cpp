@@ -163,6 +163,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_NANBEIGE,         "nanbeige"         },
     { LLM_ARCH_INKLING,          "inkling"          },
     { LLM_ARCH_QWEN3TTS,         "qwen3tts"         },
+    { LLM_ARCH_QWEN3OMNITALKER,  "qwen3omnitalker"  },
     { LLM_ARCH_POCKETTTS,        "pockettts"        },
     { LLM_ARCH_K2_HORIZON,       "k2-horizon"       },
     { LLM_ARCH_UNKNOWN,          "(unknown)"        },
@@ -1302,6 +1303,7 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_INKLING:
         case LLM_ARCH_GLM5_NEXT:
         case LLM_ARCH_QWEN3TTS:
+        case LLM_ARCH_QWEN3OMNITALKER:
             return false;
         default:
             return true;

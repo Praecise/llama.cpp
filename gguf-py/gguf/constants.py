@@ -486,6 +486,19 @@ class Keys:
             HEAD_COUNT_KV   = "clip.gen.audio.attention.head_count_kv"
             LAYERNORM_EPS   = "clip.gen.audio.attention.layer_norm_epsilon"
 
+        ROPE_THETA          = "clip.gen.audio.rope_theta"
+
+        # waveform decoder (codes -> PCM)
+        class Wav:
+            BLOCK_COUNT          = "clip.gen.audio.wav.block_count"
+            HEAD_COUNT           = "clip.gen.audio.wav.attention.head_count"
+            HEAD_COUNT_KV        = "clip.gen.audio.wav.attention.head_count_kv"
+            LAYERNORM_EPS        = "clip.gen.audio.wav.attention.layer_norm_epsilon"
+            ROPE_THETA           = "clip.gen.audio.wav.rope_theta"
+            SLIDING_WINDOW       = "clip.gen.audio.wav.sliding_window"
+            UPSAMPLE_BLOCK_COUNT = "clip.gen.audio.wav.upsample_block_count"
+            DECODER_BLOCK_COUNT  = "clip.gen.audio.wav.decoder_block_count"
+
     class Diffusion:
         SHIFT_LOGITS         = "diffusion.shift_logits"
         CANVAS_LENGTH        = "diffusion.canvas_length"
@@ -673,6 +686,7 @@ class MODEL_ARCH(IntEnum):
     NANBEIGE         = auto()
     INKLING          = auto()
     QWEN3TTS         = auto()
+    QWEN3OMNITALKER  = auto()
     POCKETTTS        = auto()
     K2HORIZON        = auto()
 
@@ -1164,6 +1178,9 @@ class MODEL_TENSOR(IntEnum):
     A_GEN_CODE_FFN_UP      = auto()
     A_GEN_CODE_FFN_DOWN    = auto()
     A_GEN_CODE_OUTPUT_NORM = auto()
+    A_GEN_COND_FC1         = auto() # conditioning MLP: hidden state of the reading model -> backbone width
+    A_GEN_COND_FC2         = auto()
+    A_GEN_WAV_CODE_EMBD    = auto() # per-codebook embedding table of the waveform decoder, rows offset by codebook
     # qwen3tts code2wav: RVQ codes -> raw PCM
     A_GEN_WAV_QUANT_FIRST_IN       = auto() # semantic RVQ, in_proj (1x1 conv, loaded as 2D)
     A_GEN_WAV_QUANT_FIRST_OUT      = auto() # semantic RVQ, out_proj
@@ -1474,6 +1491,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.NANBEIGE:         "nanbeige",
     MODEL_ARCH.INKLING:          "inkling",
     MODEL_ARCH.QWEN3TTS:         "qwen3tts",
+    MODEL_ARCH.QWEN3OMNITALKER:  "qwen3omnitalker",
     MODEL_ARCH.POCKETTTS:        "pockettts",
     MODEL_ARCH.K2HORIZON:        "k2-horizon",
 }
@@ -1994,6 +2012,9 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.A_GEN_WAV_DAC_RES_CONV2:   "a.gen.wav.dac.blk.{bid}.res.{xid}.conv2",
     MODEL_TENSOR.A_GEN_WAV_DAC_POST_SNAKE:  "a.gen.wav.dac.post_snake",
     MODEL_TENSOR.A_GEN_WAV_DAC_POST_CONV:   "a.gen.wav.dac.post_conv",
+    MODEL_TENSOR.A_GEN_COND_FC1:            "a.gen.cond.fc1",
+    MODEL_TENSOR.A_GEN_COND_FC2:            "a.gen.cond.fc2",
+    MODEL_TENSOR.A_GEN_WAV_CODE_EMBD:       "a.gen.wav.code_embd",
     MODEL_TENSOR.A_ENC_SEANET_CONV_IN:      "a.seanet.conv_in",
     MODEL_TENSOR.A_ENC_SEANET_CONV_OUT:     "a.seanet.conv_out",
     MODEL_TENSOR.A_ENC_SEANET_RES_CONV1:    "a.seanet.blk.{bid}.res_conv1",
@@ -2357,6 +2378,9 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.A_GEN_WAV_DAC_RES_CONV2,
         MODEL_TENSOR.A_GEN_WAV_DAC_POST_SNAKE,
         MODEL_TENSOR.A_GEN_WAV_DAC_POST_CONV,
+        MODEL_TENSOR.A_GEN_COND_FC1,
+        MODEL_TENSOR.A_GEN_COND_FC2,
+        MODEL_TENSOR.A_GEN_WAV_CODE_EMBD,
         MODEL_TENSOR.A_ENC_SEANET_CONV_IN,
         MODEL_TENSOR.A_ENC_SEANET_CONV_OUT,
         MODEL_TENSOR.A_ENC_SEANET_RES_CONV1,
@@ -5928,6 +5952,27 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_DOWN,
         MODEL_TENSOR.FFN_UP,
     ],
+    MODEL_ARCH.QWEN3OMNITALKER: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_NORM,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_GATE_INP_SHEXP,
+        MODEL_TENSOR.FFN_GATE_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_SHEXP,
+        MODEL_TENSOR.FFN_UP_SHEXP,
+    ],
     MODEL_ARCH.POCKETTTS: [
         MODEL_TENSOR.TOKEN_EMBD,
         MODEL_TENSOR.OUTPUT_NORM,
@@ -6271,6 +6316,7 @@ class VisionProjectorType:
     NEMOTRON_V2_VL = "nemotron_v2_vl"
     QWEN3TTS_SPKENC = "qwen3tts_spkenc" # audio: ECAPA-TDNN speaker encoder
     QWEN3TTS_GEN = "qwen3tts_gen" # audio generation: code_predictor
+    QWEN3OMNI_GEN = "qwen3omni_gen" # audio generation for an omni model: conditioning MLP, code_predictor, code2wav
     POCKETTTS_SPKENC = "pockettts_spkenc" # audio: mimi encoder as voice-prompt encoder
     POCKETTTS_GEN = "pockettts_gen" # audio generation: flow-matching decoder + mimi decoder
     HUNYUANVL      = "hunyuanvl"

@@ -121,12 +121,18 @@ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 
+// C linkage: bindings in other languages read a layer's input (for example a talker
+// conditioned on an inner layer of the model it speaks for)
+extern "C" {
+
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
+
+}
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 

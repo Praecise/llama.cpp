@@ -1622,6 +1622,33 @@ class GGUFWriter:
     def add_gen_audio_model_variant(self, value: str) -> None:
         self.add_string(Keys.ClipGenAudio.MODEL_VARIANT, value)
 
+    def add_gen_audio_rope_theta(self, value: float) -> None:
+        self.add_float32(Keys.ClipGenAudio.ROPE_THETA, value)
+
+    def add_gen_audio_wav_block_count(self, value: int) -> None:
+        self.add_uint32(Keys.ClipGenAudio.Wav.BLOCK_COUNT, value)
+
+    def add_gen_audio_wav_head_count(self, value: int) -> None:
+        self.add_uint32(Keys.ClipGenAudio.Wav.HEAD_COUNT, value)
+
+    def add_gen_audio_wav_head_count_kv(self, value: int) -> None:
+        self.add_uint32(Keys.ClipGenAudio.Wav.HEAD_COUNT_KV, value)
+
+    def add_gen_audio_wav_layernorm_eps(self, value: float) -> None:
+        self.add_float32(Keys.ClipGenAudio.Wav.LAYERNORM_EPS, value)
+
+    def add_gen_audio_wav_rope_theta(self, value: float) -> None:
+        self.add_float32(Keys.ClipGenAudio.Wav.ROPE_THETA, value)
+
+    def add_gen_audio_wav_sliding_window(self, value: int) -> None:
+        self.add_uint32(Keys.ClipGenAudio.Wav.SLIDING_WINDOW, value)
+
+    def add_gen_audio_wav_upsample_block_count(self, value: int) -> None:
+        self.add_uint32(Keys.ClipGenAudio.Wav.UPSAMPLE_BLOCK_COUNT, value)
+
+    def add_gen_audio_wav_decoder_block_count(self, value: int) -> None:
+        self.add_uint32(Keys.ClipGenAudio.Wav.DECODER_BLOCK_COUNT, value)
+
     def add_xielu_alpha_p(self, values: Sequence[float]):
         self.add_array(Keys.xIELU.ALPHA_P, values)
 
