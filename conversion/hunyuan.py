@@ -11,7 +11,7 @@ import torch
 if TYPE_CHECKING:
     from torch import Tensor
 
-from .base import MmprojModel, ModelBase, TextModel, gguf, logger
+from .base import LazyTorchTensor, MmprojModel, ModelBase, TextModel, gguf, logger
 
 from .qwen import QwenModel
 
@@ -462,3 +462,189 @@ class HYV3Model(TextModel):
             experts = [k for d in self._experts for k in d.keys()]
             if experts:
                 raise ValueError(f"Unprocessed experts: {experts}")
+
+
+@ModelBase.register("HunyuanImage3ForCausalMM")
+@ModelBase.example("tencent/HunyuanImage-3.0")
+class HunyuanImage3Model(TextModel):
+    """HunyuanImage 3.0: the mixture-of-experts backbone goes to the GGUF file; the image head
+    (latent patch embedding, timestep embedders, final layer) and the latent decoder are written
+    unchanged to `<output>.image.safetensors` next to it, for the engine's image side.
+
+    Two-axis rotary positions: each head's query/key dimensions are reordered to
+    [row pairs, column pairs] and a frequency-factor table restores the original interleaved
+    frequencies, so the backbone rotates as a two-section M-RoPE."""
+    model_arch = gguf.MODEL_ARCH.HUNYUAN_IMAGE3
+
+    image_side_prefixes = ("patch_embed.", "time_embed.", "time_embed_2.", "timestep_emb.", "final_layer.", "vae.")
+    skipped_prefixes = ("vision_model.", "vision_aligner.")
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        rope = dict(self.rope_parameters)
+        if rope.get("type", rope.get("rope_type")) == "custom":
+            if float(rope.get("alpha", 1.0)) != 1.0 or float(rope.get("factor", 1.0)) != 1.0:
+                raise ValueError(f"HunyuanImage 3.0 RoPE scaling {rope} is not supported")
+            for k in ("type", "rope_type"):
+                self.rope_parameters.pop(k, None)
+        if self.hparams.get("rope_type", "2d") != "2d":
+            raise ValueError(f"HunyuanImage 3.0 rope_type {self.hparams.get('rope_type')} is not supported")
+        self._image_side: dict[str, Tensor] = {}
+        self._experts: list[dict[str, Tensor]] | None = None
+
+    def set_vocab(self):
+        if (self.dir_model / "tokenizer.json").is_file():
+            self._set_vocab_gpt2()
+        else:
+            self._set_vocab_none()
+            self.gguf_writer.add_vocab_size(self.hparams["vocab_size"])
+
+    def _head_dim(self) -> int:
+        return int(self.hparams.get("attention_head_dim", self.hparams.get("head_dim")))
+
+    def _pair_order(self) -> list[int]:
+        half = self._head_dim() // 2
+        return list(range(0, half, 2)) + list(range(1, half, 2))
+
+    def _dim_order(self) -> list[int]:
+        half = self._head_dim() // 2
+        pairs = self._pair_order()
+        return pairs + [p + half for p in pairs]
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        hp = self.hparams
+        hd = self._head_dim()
+        self.gguf_writer.add_key_length(hd)
+        self.gguf_writer.add_value_length(hd)
+        self.gguf_writer.add_layer_norm_rms_eps(hp["rms_norm_eps"])
+
+        def same(key):
+            v = hp[key]
+            if isinstance(v, list):
+                assert all(x == v[0] for x in v), f"per-layer {key} is not supported"
+                return v[0]
+            return v
+
+        moe_ff = same("moe_intermediate_size")
+        self.gguf_writer.add_expert_count(same("num_experts"))
+        self.gguf_writer.add_expert_used_count(same("moe_topk"))
+        self.gguf_writer.add_expert_feed_forward_length(moe_ff)
+        n_shared = same("num_shared_expert")
+        self.gguf_writer.add_expert_shared_count(n_shared)
+        self.gguf_writer.add_expert_shared_feed_forward_length(moe_ff * n_shared)
+        quarter = hd // 4
+        self.gguf_writer.add_rope_dimension_sections([quarter, quarter, 0, 0])
+        self.gguf_writer.add_rope_freq_base(float(hp.get("rope_theta", 10000.0)))
+
+    def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
+        hd = self._head_dim()
+        base = float(self.hparams.get("rope_theta", 10000.0))
+        pairs = self._pair_order()
+        factors = [base ** (2.0 * (orig - new) / hd) for new, orig in enumerate(pairs)]
+        yield (self.format_tensor_name(gguf.MODEL_TENSOR.ROPE_FREQS), torch.tensor(factors, dtype=torch.float32))
+
+    def _permute_rows(self, w: Tensor, n_heads: int) -> Tensor:
+        hd = self._head_dim()
+        order = torch.tensor(self._dim_order())
+        w = w.reshape(n_heads, hd, *w.shape[1:])
+        return w[:, order].reshape(n_heads * hd, *w.shape[2:])
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        T = gguf.MODEL_TENSOR
+        if name.startswith(self.image_side_prefixes):
+            self._image_side[name] = data_torch
+            return
+        if name.startswith(self.skipped_prefixes):
+            return
+
+        if name == "model.wte.weight":
+            yield (self.format_tensor_name(T.TOKEN_EMBD), data_torch)
+            return
+        if name == "lm_head.weight":
+            yield (self.format_tensor_name(T.OUTPUT), data_torch)
+            return
+        if name == "model.ln_f.weight":
+            yield (self.format_tensor_name(T.OUTPUT_NORM), data_torch)
+            return
+
+        assert bid is not None, f"unexpected tensor {name}"
+        n_head = self.hparams["num_attention_heads"]
+        n_kv = self.hparams["num_key_value_heads"]
+        hd = self._head_dim()
+        groups = n_head // n_kv
+        suffix = name.split(f"model.layers.{bid}.", 1)[1]
+
+        if suffix == "self_attn.qkv_proj.weight":
+            w = data_torch.reshape(n_kv, groups + 2, hd, -1)
+            q = w[:, :groups].reshape(n_head * hd, -1)
+            k = w[:, groups].reshape(n_kv * hd, -1)
+            v = w[:, groups + 1].reshape(n_kv * hd, -1)
+            yield (self.format_tensor_name(T.ATTN_Q, bid), self._permute_rows(q, n_head))
+            yield (self.format_tensor_name(T.ATTN_K, bid), self._permute_rows(k, n_kv))
+            yield (self.format_tensor_name(T.ATTN_V, bid), v)
+            return
+        if suffix in ("self_attn.query_layernorm.weight", "self_attn.key_layernorm.weight"):
+            key = T.ATTN_Q_NORM if suffix.startswith("self_attn.query") else T.ATTN_K_NORM
+            yield (self.format_tensor_name(key, bid), data_torch[torch.tensor(self._dim_order())])
+            return
+        simple = {
+            "self_attn.o_proj.weight": T.ATTN_OUT,
+            "input_layernorm.weight": T.ATTN_NORM,
+            "post_attention_layernorm.weight": T.FFN_NORM,
+            "mlp.gate.wg.weight": T.FFN_GATE_INP,
+            "mlp.shared_mlp.down_proj.weight": T.FFN_DOWN_SHEXP,
+        }
+        if suffix in simple:
+            yield (self.format_tensor_name(simple[suffix], bid), data_torch)
+            return
+        if suffix == "mlp.shared_mlp.gate_and_up_proj.weight":
+            # The activation applies to the second half: down(first * act(second)).
+            up, gate = data_torch.chunk(2, dim=0)
+            yield (self.format_tensor_name(T.FFN_UP_SHEXP, bid), up)
+            yield (self.format_tensor_name(T.FFN_GATE_SHEXP, bid), gate)
+            return
+        if ".mlp.experts." in name:
+            n_experts = self.hparams["num_experts"]
+            n_experts = n_experts if isinstance(n_experts, int) else n_experts[bid]
+            if self._experts is None:
+                self._experts = [{} for _ in range(self.block_count)]
+            self._experts[bid][name] = data_torch
+            if len(self._experts[bid]) < n_experts * 2:
+                return
+            ups, gates, downs = [], [], []
+            for xid in range(n_experts):
+                gu = self._experts[bid].pop(f"model.layers.{bid}.mlp.experts.{xid}.gate_and_up_proj.weight")
+                up, gate = gu.chunk(2, dim=0)
+                ups.append(up)
+                gates.append(gate)
+                downs.append(self._experts[bid].pop(f"model.layers.{bid}.mlp.experts.{xid}.down_proj.weight"))
+            yield (self.format_tensor_name(T.FFN_UP_EXP, bid), torch.stack(ups, dim=0))
+            yield (self.format_tensor_name(T.FFN_GATE_EXP, bid), torch.stack(gates, dim=0))
+            yield (self.format_tensor_name(T.FFN_DOWN_EXP, bid), torch.stack(downs, dim=0))
+            return
+        raise ValueError(f"unexpected tensor {name}")
+
+    def prepare_tensors(self):
+        super().prepare_tensors()
+        if self._experts is not None and any(len(d) for d in self._experts):
+            raise ValueError("unprocessed expert tensors")
+        if not self._image_side:
+            raise ValueError("the checkpoint has no image head tensors")
+
+    def write(self):
+        super().write()
+        from safetensors.torch import save_file
+        hp = self.hparams
+        config = {
+            "hidden_size": hp["hidden_size"],
+            "patch_embed_hidden_dim": hp.get("patch_embed_hidden_dim", 1024),
+            "patch_size": hp.get("patch_size", 1),
+            "vae": hp["vae"],
+        }
+        if hp.get("img_proj_type", "unet") != "unet":
+            raise ValueError(f"image projection {hp.get('img_proj_type')} is not supported")
+        out = Path(str(self.fname_out).removesuffix(".gguf") + ".image.safetensors")
+        tensors = {k: LazyTorchTensor.to_eager(v).contiguous() for k, v in sorted(self._image_side.items())}
+        save_file(tensors, str(out), metadata={"format": "pt", "config": json.dumps(config)})
+        logger.info(f"image head and latent decoder: {len(tensors)} tensors -> {out}")

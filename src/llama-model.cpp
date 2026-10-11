@@ -294,6 +294,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_hunyuan_moe(params);
         case LLM_ARCH_HUNYUAN_VL:
             return new llama_model_hunyuan_vl(params);
+        case LLM_ARCH_HUNYUAN_IMAGE3:
+            return new llama_model_hunyuan_image3(params);
         case LLM_ARCH_HUNYUAN_DENSE:
             return new llama_model_hunyuan_dense(params);
         case LLM_ARCH_HY_V3:
@@ -3411,6 +3413,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
 
         case LLM_ARCH_QWEN2VL:
         case LLM_ARCH_PADDLEOCR:
+        case LLM_ARCH_HUNYUAN_IMAGE3:
             return LLAMA_ROPE_TYPE_MROPE;
         case LLM_ARCH_QWEN3VL:
         case LLM_ARCH_QWEN3VLMOE:
