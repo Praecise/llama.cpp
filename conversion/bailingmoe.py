@@ -190,6 +190,19 @@ class BailingMoeV2Model(TextModel):
                 raise ValueError(f"Unprocessed experts: {experts}")
 
 
+@ModelBase.register("LLaDA2MoeModelLM")
+class LLaDA2MoeModel(BailingMoeV2Model):
+    # BailingMoeV2 trained for block diffusion: decoded by unmasking, so the
+    # logits at a position predict that position.
+    model_arch = gguf.MODEL_ARCH.LLADA2
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        self.gguf_writer.add_diffusion_shift_logits(False)
+        if (mask_token_id := self.hparams.get("mask_token_id")) is not None:
+            self.gguf_writer.add_mask_token_id(mask_token_id)
+
+
 @ModelBase.register("SarvamMoEForCausalLM", "modeling_sarvam_moe.SarvamMoEForCausalLM")
 @ModelBase.example("sarvamai/sarvam-30b")
 class SarvamMoEModel(BailingMoeV2Model):

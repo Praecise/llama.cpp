@@ -1831,6 +1831,15 @@ struct llama_model_bailingmoe2 : public llama_model_base {
 };
 
 
+// The BailingMoeV2 network trained for block diffusion: the same weights and
+// graph, with attention over a block in both directions and over earlier
+// blocks through the cache.
+struct llama_model_llada2 : public llama_model_bailingmoe2 {
+    llama_model_llada2(const struct llama_model_params & params) : llama_model_bailingmoe2(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+};
+
+
 struct llama_model_bailingmoe3 : public llama_model_base {
     llama_model_bailingmoe3(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
