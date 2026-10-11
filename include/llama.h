@@ -1849,6 +1849,11 @@ extern "C" {
     LLAMA_API int32_t      llama_opt_grad_n_ops(const struct llama_context * lctx);
     LLAMA_API const char * llama_opt_grad_op   (const struct llama_context * lctx, int32_t i);
 
+    // distinct "OP@BACKEND" pairs of the same graph: each op with the backend the scheduler ran it
+    // on, in ascending order; lets a caller refuse a graph that left the device it asked for
+    LLAMA_API int32_t      llama_opt_grad_n_placements(const struct llama_context * lctx);
+    LLAMA_API const char * llama_opt_grad_placement   (const struct llama_context * lctx, int32_t i);
+
     // a weight of the model by its GGUF name, NULL if there is none
     LLAMA_API struct ggml_tensor * llama_model_get_tensor(const struct llama_model * model, const char * name);
 

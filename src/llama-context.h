@@ -211,6 +211,7 @@ struct llama_context {
     struct ggml_tensor * opt_grad(const struct ggml_tensor * param);
     void opt_grad_reset();
     const std::vector<const char *> & opt_grad_ops() const { return opt_graph_ops; }
+    const std::vector<std::string>  & opt_grad_placements() const { return opt_graph_placements; }
 
     // TODO: more flexible combinations of logical/physical batch size and context size
     void opt_epoch(
@@ -392,6 +393,7 @@ private:
     ggml_opt_context_t opt_ctx = nullptr;
     bool opt_grad_graphs = false; // graphs sized for a backward pass, see opt_grad_init
     std::vector<const char *> opt_graph_ops; // distinct op names of the last gradient-only pass
+    std::vector<std::string>  opt_graph_placements; // distinct OP@BACKEND pairs of the same pass
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;

@@ -8148,6 +8148,33 @@ struct test_acc : public test_case {
     }
 };
 
+// GGML_OP_ACC into a view whose dims 1 and 2 are swapped (row stride above plane stride),
+// as the backward pass of a permuted view produces
+struct test_acc_permuted : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne_a;
+
+    std::string vars() override {
+        return VARS_TO_STR2(type, ne_a);
+    }
+
+    test_acc_permuted(ggml_type type = GGML_TYPE_F32, std::array<int64_t, 4> ne_a = {16, 5, 3, 2})
+        : type(type), ne_a(ne_a) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+        const int64_t ne_b[4] = {ne_a[0], ne_a[2], ne_a[1], ne_a[3]};
+        ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne_b);
+        ggml_set_param(b);
+        ggml_set_name(b, "b");
+        ggml_tensor * out = ggml_acc(ctx, a, b, a->nb[2], a->nb[1], a->nb[3], 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_PAD
 struct test_pad : public test_case {
     const ggml_type type;
@@ -12217,6 +12244,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {256, 16, 2, 3}, 1));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {128, 16, 2, 3}, 2));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {64, 16, 2, 3}, 3));
+    test_cases.emplace_back(new test_acc_permuted(GGML_TYPE_F32, {16, 5, 3, 2}));
+    test_cases.emplace_back(new test_acc_permuted(GGML_TYPE_F32, {256, 7, 4, 1}));
 
     test_cases.emplace_back(new test_pad());
     test_cases.emplace_back(new test_pad(GGML_TYPE_F32, {33, 17, 2, 1}, 4, 3, true)); // circular

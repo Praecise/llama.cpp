@@ -21,6 +21,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -3833,6 +3834,20 @@ int32_t llama_context::opt_grad_init(struct llama_model * model, enum ggml_opt_l
         return -4;
     }
 
+    // a gradient is computed in FP32: a backend that rounds F32 products to a narrower format by
+    // default (TF32 tensor ops) computes them in full FP32 for this context
+    for (auto & backend : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+        if (dev == nullptr) {
+            continue;
+        }
+        auto set_fp32_gemm = (void (*)(ggml_backend_t, bool))
+            ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_set_fp32_gemm");
+        if (set_fp32_gemm) {
+            set_fp32_gemm(backend.get(), true);
+        }
+    }
+
     // size the graphs and the scheduler for gradient graphs before the optimizer context takes the scheduler
     opt_grad_graphs    = true;
     sched_need_reserve = true;
@@ -3977,9 +3992,10 @@ int32_t llama_context::opt_grad_sequence(const llama_token * tokens, int32_t n_t
             ggml_backend_tensor_memset(labels, 0, 0, ggml_nbytes(labels));
         }
 
+        // the graph the run evaluates; it stays valid until the next allocation
+        ggml_cgraph * graph = ggml_opt_eval_graph(opt_ctx);
+        GGML_ASSERT(graph);
         {
-            ggml_cgraph * graph = ggml_opt_eval_graph(opt_ctx);
-            GGML_ASSERT(graph);
             // op names are static strings; order them by content
             std::map<std::string, const char *> names;
             for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
@@ -3993,6 +4009,17 @@ int32_t llama_context::opt_grad_sequence(const llama_token * tokens, int32_t n_t
         }
 
         ggml_opt_eval(opt_ctx, nullptr);
+
+        {
+            // where the scheduler ran each op, read after the run that assigned it
+            std::set<std::string> placed;
+            for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+                ggml_tensor * node = ggml_graph_node(graph, i);
+                ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched.get(), node);
+                placed.insert(std::string(ggml_op_name(node->op)) + "@" + (b ? ggml_backend_name(b) : "none"));
+            }
+            opt_graph_placements.assign(placed.begin(), placed.end());
+        }
 
         if (logits_out) {
             ggml_backend_tensor_get(logits, logits_out, 0, ggml_nbytes(logits));
@@ -4955,6 +4982,15 @@ int32_t llama_opt_grad_n_ops(const struct llama_context * ctx) {
 const char * llama_opt_grad_op(const struct llama_context * ctx, int32_t i) {
     const auto & ops = ctx->opt_grad_ops();
     return i >= 0 && (size_t) i < ops.size() ? ops[i] : nullptr;
+}
+
+int32_t llama_opt_grad_n_placements(const struct llama_context * ctx) {
+    return (int32_t) ctx->opt_grad_placements().size();
+}
+
+const char * llama_opt_grad_placement(const struct llama_context * ctx, int32_t i) {
+    const auto & p = ctx->opt_grad_placements();
+    return i >= 0 && (size_t) i < p.size() ? p[i].c_str() : nullptr;
 }
 
 struct ggml_tensor * llama_model_get_tensor(const struct llama_model * model, const char * name) {

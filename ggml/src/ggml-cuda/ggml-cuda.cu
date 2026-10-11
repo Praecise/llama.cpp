@@ -2039,7 +2039,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
         return;
     }
-    if (!f32_pedantic && ggml_cuda_should_use_mmf(
+    // the F32 tensor-core kernel rounds its inputs to TF32: a context computing in full FP32 uses cuBLAS
+    const bool tf32_ok = !(ctx.fp32_gemm && src0->type == GGML_TYPE_F32);
+    if (!f32_pedantic && tf32_ok && ggml_cuda_should_use_mmf(
             src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
@@ -6161,8 +6163,26 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// every F32 cuBLAS product of this backend instance in full FP32 (true) or with TF32 tensor ops (false)
+static void ggml_backend_cuda_set_fp32_gemm(ggml_backend_t backend, bool fp32) {
+    GGML_ASSERT(ggml_backend_is_cuda(backend));
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    ctx->fp32_gemm = fp32;
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
+        for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+            if (ctx->cublas_handles[d][s] != nullptr) {
+                ggml_cuda_set_device(d);
+                CUBLAS_CHECK(cublasSetMathMode(ctx->cublas_handles[d][s], fp32 ? CUBLAS_DEFAULT_MATH : CUBLAS_TF32_TENSOR_OP_MATH));
+            }
+        }
+    }
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_set_fp32_gemm") == 0) {
+        return (void *)ggml_backend_cuda_set_fp32_gemm;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }
