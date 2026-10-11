@@ -99,6 +99,15 @@
 #define KEY_GEN_AUDIO_PROJ_TYPE    "clip.gen.audio.projector_type" // for models with mixed modalities
 // name of the weight variant, for settings that are not in the checkpoint
 #define KEY_GEN_AUDIO_VARIANT      "clip.gen.audio.model_variant"
+#define KEY_GEN_AUDIO_ROPE_THETA   "clip.gen.audio.rope_theta"
+#define KEY_GEN_WAV_N_BLOCK        "clip.gen.audio.wav.block_count"
+#define KEY_GEN_WAV_N_HEAD         "clip.gen.audio.wav.attention.head_count"
+#define KEY_GEN_WAV_N_HEAD_KV      "clip.gen.audio.wav.attention.head_count_kv"
+#define KEY_GEN_WAV_EPS            "clip.gen.audio.wav.attention.layer_norm_epsilon"
+#define KEY_GEN_WAV_ROPE_THETA     "clip.gen.audio.wav.rope_theta"
+#define KEY_GEN_WAV_WINDOW         "clip.gen.audio.wav.sliding_window"
+#define KEY_GEN_WAV_N_UPSAMPLE     "clip.gen.audio.wav.upsample_block_count"
+#define KEY_GEN_WAV_N_DECODER      "clip.gen.audio.wav.decoder_block_count"
 #define KEY_AUDIO_SUBSMPL_FACTOR   "clip.audio.subsampling_factor"
 
 //
@@ -233,6 +242,10 @@
 #define TN_A_GEN_CODE_OUT_EMBD "a.gen.code.out_embd.%s"
 #define TN_A_GEN_CODE_NORM     "a.gen.code.output_norm.%s"
 
+// conditioning MLP: hidden state of the reading model -> backbone width
+#define TN_A_GEN_COND_FC1      "a.gen.cond.fc1.%s"
+#define TN_A_GEN_COND_FC2      "a.gen.cond.fc2.%s"
+
 // qwen3tts code2wav (RVQ codes -> raw PCM)
 // pre_transformer layers use the generic TN_ATTN_*/TN_FFN_*/TN_LN_*/TN_LS_* macros, prefix "a.gen.wav.tfm"
 #define TN_A_GEN_WAV_QUANT_FIRST_IN  "a.gen.wav.quant.first.in_proj.%s"
@@ -242,6 +255,7 @@
 #define TN_A_GEN_WAV_QUANT_REST_OUT  "a.gen.wav.quant.rest.out_proj.%s"
 #define TN_A_GEN_WAV_QUANT_REST_CB   "a.gen.wav.quant.rest.codebook.%s"
 #define TN_A_GEN_WAV_PRE_CONV        "a.gen.wav.pre_conv.%s"
+#define TN_A_GEN_WAV_CODE_EMBD       "a.gen.wav.code_embd.%s"
 #define TN_A_GEN_WAV_TFM_IN_PROJ     "a.gen.wav.tfm.in_proj.%s"
 #define TN_A_GEN_WAV_TFM_OUT_PROJ    "a.gen.wav.tfm.out_proj.%s"
 #define TN_A_GEN_WAV_TFM_OUT_NORM    "a.gen.wav.tfm.output_norm.%s"
@@ -519,6 +533,7 @@ enum projector_type {
     PROJECTOR_TYPE_MIMO_AUDIO,
     PROJECTOR_TYPE_QWEN3TTS_SPKENC,
     PROJECTOR_TYPE_QWEN3TTS_GEN,
+    PROJECTOR_TYPE_QWEN3OMNI_GEN,
     PROJECTOR_TYPE_POCKETTTS_SPKENC,
     PROJECTOR_TYPE_POCKETTTS_GEN,
     PROJECTOR_TYPE_MUSE_GLIMMER,
@@ -592,6 +607,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_PARAKEET,          "parakeet"},
     { PROJECTOR_TYPE_QWEN3TTS_SPKENC,   "qwen3tts_spkenc"},
     { PROJECTOR_TYPE_QWEN3TTS_GEN,      "qwen3tts_gen"},
+    { PROJECTOR_TYPE_QWEN3OMNI_GEN,     "qwen3omni_gen"},
     { PROJECTOR_TYPE_POCKETTTS_SPKENC,  "pockettts_spkenc"},
     { PROJECTOR_TYPE_POCKETTTS_GEN,     "pockettts_gen"},
     { PROJECTOR_TYPE_MUSE_GLIMMER,      "muse-glimmer"},

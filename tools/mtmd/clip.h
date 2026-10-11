@@ -94,6 +94,7 @@ enum clip_gen_process_type {
     CLIP_GEN_PROCESS_GEN_UNKNOWN,
     CLIP_GEN_PROCESS_GEN_CODE, // h_state to codes
     CLIP_GEN_PROCESS_GEN_WAV,  // codes to raw PCM audio
+    CLIP_GEN_PROCESS_GEN_COND, // hidden states of the reading model to backbone-width rows
 };
 struct clip_encode_params {
     int n_threads = 1;
@@ -119,8 +120,14 @@ struct clip_encode_params {
     std::vector<float> * out_audio = nullptr;         // decoded PCM samples, F32
     const std::vector<uint8_t> * state_in  = nullptr; // state from previous call, null or wrong size means cold start
     std::vector<uint8_t> *       state_out = nullptr; // state for the next call
+
+    // GEN_COND: rows of the reading model's hidden states; out_feats receives one backbone-width row each
+    const std::vector<float> * cond = nullptr;
 };
 bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params);
+
+// width of the rows GEN_COND takes, 0 when the projector has no conditioning MLP
+int clip_gen_cond_n_in(const struct clip_ctx * ctx);
 
 bool clip_is_llava(const struct clip_ctx * ctx);
 // note for contributor: this clip_is_(model) pattern is deprecated

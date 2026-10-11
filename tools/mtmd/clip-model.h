@@ -542,6 +542,9 @@ struct clip_code2wav {
     ggml_tensor * quant_rest_out_w  = nullptr;
     ggml_tensor * quant_rest_cb_w   = nullptr; // codebooks, merged 3D [15, vocab, dim]
 
+    // codebook embedding averaged over the codebooks, in place of the RVQ decode and pre_conv
+    ggml_tensor * code_embd_w = nullptr; // [dim, n_codebooks * vocab]
+
     ggml_tensor * pre_conv_w = nullptr;
     ggml_tensor * pre_conv_b = nullptr;
 
@@ -805,6 +808,12 @@ struct clip_model {
     ggml_tensor * gen_code_head_w     = nullptr; // per-codebook output head, merged 3D
     ggml_tensor * gen_code_out_embd_w = nullptr; // codebook-0 embedding, fed back into the talker
     ggml_tensor * gen_code_norm_w     = nullptr; // final norm
+
+    // conditioning MLP: hidden state of the reading model -> backbone width
+    ggml_tensor * gen_cond_fc1_w = nullptr;
+    ggml_tensor * gen_cond_fc1_b = nullptr;
+    ggml_tensor * gen_cond_fc2_w = nullptr;
+    ggml_tensor * gen_cond_fc2_b = nullptr;
 
     // qwen3tts code2wav: RVQ codes -> raw PCM
     clip_code2wav c2w;

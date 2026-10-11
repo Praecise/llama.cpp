@@ -625,7 +625,7 @@ struct mtmd_context {
         ctx_v = res.ctx_v;
         ctx_a = res.ctx_a;
         ctx_gen_a = res.ctx_gen_a;
-        if (!ctx_v && !ctx_a) {
+        if (!ctx_v && !ctx_a && !ctx_gen_a) {
             throw std::runtime_error(string_format("Failed to load CLIP model from %s\n", mmproj_fname));
         }
 
@@ -642,7 +642,8 @@ struct mtmd_context {
 
         // since we already validate n_embd of vision and audio mmproj,
         // we can safely assume that they are the same
-        int n_embd_clip = clip_n_mmproj_embd(ctx_v ? ctx_v : ctx_a);
+        // a projector that only generates audio has no input encoder to check
+        int n_embd_clip = (ctx_v || ctx_a) ? clip_n_mmproj_embd(ctx_v ? ctx_v : ctx_a) : n_embd_text;
         if (n_embd_text > 0 && n_embd_text != n_embd_clip) {
             throw std::runtime_error(string_format(
                 "mismatch between text model (n_embd = %d) and mmproj (n_embd = %d)\n"
@@ -2061,10 +2062,16 @@ mtmd_gen_audio_info mtmd_gen_audio_get_info(const mtmd_context * ctx) {
         case PROJECTOR_TYPE_QWEN3TTS_GEN:
             info.type = MTMD_GEN_AUDIO_TYPE_QWEN3TTS;
             info.sample_rate = 24000;
+            info.wav_window = clip_get_hparams(ctx->ctx_gen_a)->wav_tfm_swa;
             break;
         case PROJECTOR_TYPE_POCKETTTS_GEN:
             info.type = MTMD_GEN_AUDIO_TYPE_POCKETTTS;
             info.sample_rate = 24000;
+            break;
+        case PROJECTOR_TYPE_QWEN3OMNI_GEN:
+            info.type = MTMD_GEN_AUDIO_TYPE_QWEN3OMNI;
+            info.sample_rate = 24000;
+            info.wav_window = clip_get_hparams(ctx->ctx_gen_a)->wav_tfm_swa;
             break;
         default:
             info.type = MTMD_GEN_AUDIO_TYPE_NONE;
@@ -2087,6 +2094,12 @@ mtmd_gen_inp mtmd_gen_inp_default(const mtmd_context * ctx) {
             inp.top_k = 50;
             inp.top_p = 1.0f;
             inp.temp  = 0.9f; // TODO: handle this on graph
+            break;
+        case PROJECTOR_TYPE_QWEN3OMNI_GEN:
+            // the reference samples the code predictor with top_k 50, top_p 0.8
+            inp.top_k = 50;
+            inp.top_p = 0.8f;
+            inp.temp  = 0.9f;
             break;
         case PROJECTOR_TYPE_POCKETTTS_GEN:
             // https://github.com/kyutai-labs/pocket-tts/blob/main/pocket_tts/default_parameters.py
@@ -2154,6 +2167,41 @@ static int32_t mtmd_gen_audio_process_impl(mtmd_context * ctx, const mtmd_gen_in
         out->feats     = ctx->gen_out_feats.data();
         out->n_feats   = ctx->gen_out_feats.size();
         out->is_eos    = is_eos;
+        return 0;
+    }
+
+    if (inp->type == MTMD_GEN_PROCESS_TYPE_GEN_COND) {
+        if (!inp->cond || inp->n_cond == 0) {
+            LOG_ERR("%s: gen_cond requires rows\n", __func__);
+            return 1;
+        }
+        const size_t n_in = (size_t) clip_gen_cond_n_in(ctx_clip);
+        if (n_in == 0) {
+            LOG_ERR("%s: this projector has no conditioning MLP\n", __func__);
+            return 1;
+        }
+        std::vector<float> in_cond(inp->cond, inp->cond + inp->n_cond * n_in);
+
+        clip_image_f32 dummy;
+        dummy.set_size({1, 1}, false, true);
+        dummy.cpy_buf(std::vector<float>(1, 0.0f));
+        clip_image_f32_batch batch;
+        batch.is_audio = true;
+        batch.entries.push_back(std::move(dummy));
+
+        clip_encode_params params;
+        params.imgs        = &batch;
+        params.n_threads   = ctx->n_threads;
+        params.gen_process = CLIP_GEN_PROCESS_GEN_COND;
+        params.seed        = inp->seed;
+        params.cond        = &in_cond;
+        params.out_feats   = &ctx->gen_out_feats;
+        if (!clip_encode(ctx_clip, &params)) {
+            LOG_ERR("%s: clip_encode failed (gen_cond)\n", __func__);
+            return 1;
+        }
+        out->feats   = ctx->gen_out_feats.data();
+        out->n_feats = ctx->gen_out_feats.size();
         return 0;
     }
 

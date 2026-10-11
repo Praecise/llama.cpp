@@ -371,12 +371,14 @@ enum mtmd_gen_audio_type {
     MTMD_GEN_AUDIO_TYPE_NONE, // not supported
     MTMD_GEN_AUDIO_TYPE_QWEN3TTS,
     MTMD_GEN_AUDIO_TYPE_POCKETTTS,
+    MTMD_GEN_AUDIO_TYPE_QWEN3OMNI, // speaks the turn of a reading model: conditioning rows instead of text
 };
 
 struct mtmd_gen_audio_info {
     enum mtmd_gen_audio_type type;
     int32_t sample_rate; // in Hz, for example 24000 for qwen3tts
     const char * model_variant; // name of the weight variant, can be nullptr if not applicable
+    int32_t wav_window; // frames the waveform decoder attends over, 0 if not applicable
 };
 
 MTMD_API struct mtmd_gen_audio_info mtmd_gen_audio_get_info(const mtmd_context * ctx);
@@ -387,6 +389,7 @@ enum mtmd_gen_process_type {
     MTMD_GEN_PROCESS_TYPE_GEN_WAV,  // convert semantic to PCM audio
                                     // for qwen3tts, this is code2wav
                                     // for pocket-tts, this is mimi decoder
+    MTMD_GEN_PROCESS_TYPE_GEN_COND, // hidden states of the reading model to backbone-width rows
 };
 
 struct mtmd_gen_inp {
@@ -408,6 +411,10 @@ struct mtmd_gen_inp {
     size_t        n_feats;
     const char * state_data;
     size_t       state_size;
+
+    // for MTMD_GEN_PROCESS_TYPE_GEN_COND: n_cond rows of the reading model's hidden width
+    const float * cond;
+    size_t        n_cond;
 };
 
 struct mtmd_gen_out {
@@ -416,7 +423,7 @@ struct mtmd_gen_out {
     // for MTMD_GEN_PROCESS_TYPE_GEN_CODE
     const int32_t * codes;
     size_t          n_codes;
-    const float * feats; // continuous counterpart of codes
+    const float * feats; // continuous counterpart of codes; for GEN_COND, the mapped rows
     size_t        n_feats;
     const float * embd; // the generated hidden state, to be fed back to backbone
                         // it must have n_text_embd elements

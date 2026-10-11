@@ -219,6 +219,21 @@ struct mtmd_helper_gen_audio_inp {
     enum mtmd_helper_gen_audio_outtype out_type;
 };
 
+// what a pipeline that speaks a reading model's turn is conditioned on (MTMD_GEN_AUDIO_TYPE_QWEN3OMNI)
+struct mtmd_helper_gen_audio_cond {
+    // the user turns the reply answers, as the reading model saw them: one token per position,
+    // media positions (picture, audio, video) hold the model's placeholder token
+    const llama_token * tokens;
+    int32_t             n_tokens;
+
+    // one row of the reading model's inner hidden state per media position, in order
+    const float * hidden;
+    int32_t       n_hidden;
+    int32_t       n_hidden_embd; // row width
+
+    const char * speaker; // voice name, required
+};
+
 MTMD_API mtmd_helper_gen_audio * mtmd_helper_gen_audio_init(
                                     struct llama_context * lctx,
                                     struct mtmd_context * mctx);
@@ -230,6 +245,24 @@ MTMD_API void mtmd_helper_gen_audio_reset(mtmd_helper_gen_audio * ctx);
 MTMD_API int32_t mtmd_helper_gen_audio_set_input(
                         mtmd_helper_gen_audio * ctx,
                         const struct mtmd_helper_gen_audio_inp * inp);
+
+// starts a generation that speaks a reading model's reply; inp supplies seq_id, sampling and output type
+// (its prompt is unused). The reply arrives through mtmd_helper_gen_audio_push_text().
+MTMD_API int32_t mtmd_helper_gen_audio_set_cond(
+                        mtmd_helper_gen_audio * ctx,
+                        const struct mtmd_helper_gen_audio_inp * inp,
+                        const struct mtmd_helper_gen_audio_cond * cond);
+
+// hands over reply tokens as the reading model produces them, including its end-of-turn token;
+// done marks the end of the reply. step_prompt() needs the first token, and step_gen() returns
+// MTMD_HELPER_GEN_AUDIO_NEEDS_TEXT when it has spoken all text handed over so far
+MTMD_API int32_t mtmd_helper_gen_audio_push_text(
+                        mtmd_helper_gen_audio * ctx,
+                        const llama_token * tokens,
+                        int32_t n_tokens,
+                        bool done);
+
+#define MTMD_HELPER_GEN_AUDIO_NEEDS_TEXT 2
 
 // processes at most n_batch prompt tokens per call
 // returns: >0 = number of prompt tokens remaining, 0 = done, <0 = error

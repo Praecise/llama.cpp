@@ -1157,11 +1157,25 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
                 builder = std::make_unique<clip_graph_pockettts_gen>(ctx, img, gen_process, n_step, n_frames);
             } break;
         case PROJECTOR_TYPE_QWEN3TTS_GEN:
+        case PROJECTOR_TYPE_QWEN3OMNI_GEN:
             {
                 const auto  gen_process = params ? params->gen_process : CLIP_GEN_PROCESS_GEN_CODE;
                 const int   top_k = params ? params->top_k : 50;
                 const float top_p = params ? params->top_p : 1.0f;
-                builder = std::make_unique<clip_graph_qwen3tts_gen>(ctx, img, gen_process, top_k, top_p);
+                const auto & model = ctx->model;
+                // frames of this GEN_WAV call; a full window when building for reservation
+                int n_frames = ctx->model.hparams.wav_tfm_swa;
+                if (params && params->codes && gen_process == CLIP_GEN_PROCESS_GEN_WAV) {
+                    const size_t n_codes = (size_t) model.gen_code_head_w->ne[2] + 1;
+                    n_frames = (int) (params->codes->size() / n_codes);
+                }
+                int n_cond = 0;
+                if (params && params->cond && gen_process == CLIP_GEN_PROCESS_GEN_COND) {
+                    n_cond = (int) (params->cond->size() / (size_t) model.gen_cond_fc1_w->ne[0]);
+                }
+                // a GEN_WAV call without carried state starts a stream
+                const bool cold = !(params && params->state_in && !params->state_in->empty());
+                builder = std::make_unique<clip_graph_qwen3tts_gen>(ctx, img, gen_process, top_k, top_p, n_frames, n_cond, cold);
             } break;
         case PROJECTOR_TYPE_YOUTUVL:
             {
@@ -1983,6 +1997,22 @@ struct clip_model_loader {
                         hparams.wav_dac_n_res        = 3;
                         // matches the reference decoder's sliding_window (speech_tokenizer/config.json)
                         hparams.wav_tfm_swa = 72;
+                    } break;
+                case PROJECTOR_TYPE_QWEN3OMNI_GEN:
+                    {
+                        get_f32(KEY_GEN_AUDIO_ROPE_THETA, hparams.rope_theta);
+                        get_u32(KEY_GEN_WAV_N_BLOCK,      hparams.wav_tfm_n_layer);
+                        get_u32(KEY_GEN_WAV_N_HEAD,       hparams.wav_tfm_n_head);
+                        get_u32(KEY_GEN_WAV_N_HEAD_KV,    hparams.wav_tfm_n_head_kv);
+                        get_f32(KEY_GEN_WAV_EPS,          hparams.wav_tfm_eps);
+                        get_f32(KEY_GEN_WAV_ROPE_THETA,   hparams.wav_tfm_rope_theta);
+                        get_u32(KEY_GEN_WAV_WINDOW,       hparams.wav_tfm_swa);
+                        get_u32(KEY_GEN_WAV_N_UPSAMPLE,   hparams.wav_upsample_n_block);
+                        get_u32(KEY_GEN_WAV_N_DECODER,    hparams.wav_dac_n_block);
+                        hparams.wav_dac_n_res = 3;
+                        if (hparams.wav_tfm_swa <= 0) {
+                            throw std::runtime_error(string_format("%s: %s must be > 0\n", __func__, KEY_GEN_WAV_WINDOW));
+                        }
                     } break;
                 case PROJECTOR_TYPE_POCKETTTS_SPKENC:
                 case PROJECTOR_TYPE_POCKETTTS_GEN:
@@ -3208,10 +3238,21 @@ struct clip_model_loader {
                     }
                 } break;
             case PROJECTOR_TYPE_QWEN3TTS_GEN:
+            case PROJECTOR_TYPE_QWEN3OMNI_GEN:
                 {
-                    // code_predictor, proj_in is absent when the talker and the predictor share the hidden size
+                    // the omni pipeline averages codebook embeddings where the speech-only one
+                    // decodes RVQ codebooks, and adds a conditioning MLP
+                    const bool omni = model.proj_type == PROJECTOR_TYPE_QWEN3OMNI_GEN;
+
+                    // code_predictor
                     model.gen_code_proj_in_w = get_tensor(string_format(TN_A_GEN_CODE_PROJ_IN, "weight"), false);
-                    model.gen_code_proj_in_b = get_tensor(string_format(TN_A_GEN_CODE_PROJ_IN, "bias"),   false);
+                    model.gen_code_proj_in_b = get_tensor(string_format(TN_A_GEN_CODE_PROJ_IN, "bias"), false);
+                    if (omni) {
+                        model.gen_cond_fc1_w = get_tensor(string_format(TN_A_GEN_COND_FC1, "weight"));
+                        model.gen_cond_fc1_b = get_tensor(string_format(TN_A_GEN_COND_FC1, "bias"));
+                        model.gen_cond_fc2_w = get_tensor(string_format(TN_A_GEN_COND_FC2, "weight"));
+                        model.gen_cond_fc2_b = get_tensor(string_format(TN_A_GEN_COND_FC2, "bias"));
+                    }
                     model.gen_code_embd_w     = get_tensor(string_format(TN_A_GEN_CODE_EMBD,     "weight"));
                     model.gen_code_head_w     = get_tensor(string_format(TN_A_GEN_CODE_HEAD,     "weight"));
                     model.gen_code_out_embd_w = get_tensor(string_format(TN_A_GEN_CODE_OUT_EMBD, "weight"));
@@ -3221,20 +3262,24 @@ struct clip_model_loader {
                     {
                         auto & c2w = model.c2w;
 
-                        c2w.quant_first_in_w  = get_tensor(string_format(TN_A_GEN_WAV_QUANT_FIRST_IN,  "weight"));
-                        c2w.quant_first_out_w = get_tensor(string_format(TN_A_GEN_WAV_QUANT_FIRST_OUT, "weight"));
-                        c2w.quant_first_cb_w  = get_tensor(string_format(TN_A_GEN_WAV_QUANT_FIRST_CB,  "weight"));
-                        c2w.quant_rest_in_w   = get_tensor(string_format(TN_A_GEN_WAV_QUANT_REST_IN,   "weight"));
-                        c2w.quant_rest_out_w  = get_tensor(string_format(TN_A_GEN_WAV_QUANT_REST_OUT,  "weight"));
-                        c2w.quant_rest_cb_w   = get_tensor(string_format(TN_A_GEN_WAV_QUANT_REST_CB,   "weight"));
+                        if (omni) {
+                            c2w.code_embd_w = get_tensor(string_format(TN_A_GEN_WAV_CODE_EMBD, "weight"));
+                        } else {
+                            c2w.quant_first_in_w  = get_tensor(string_format(TN_A_GEN_WAV_QUANT_FIRST_IN,  "weight"));
+                            c2w.quant_first_out_w = get_tensor(string_format(TN_A_GEN_WAV_QUANT_FIRST_OUT, "weight"));
+                            c2w.quant_first_cb_w  = get_tensor(string_format(TN_A_GEN_WAV_QUANT_FIRST_CB,  "weight"));
+                            c2w.quant_rest_in_w   = get_tensor(string_format(TN_A_GEN_WAV_QUANT_REST_IN,   "weight"));
+                            c2w.quant_rest_out_w  = get_tensor(string_format(TN_A_GEN_WAV_QUANT_REST_OUT,  "weight"));
+                            c2w.quant_rest_cb_w   = get_tensor(string_format(TN_A_GEN_WAV_QUANT_REST_CB,   "weight"));
 
-                        c2w.pre_conv_w = get_tensor(string_format(TN_A_GEN_WAV_PRE_CONV, "weight"));
-                        c2w.pre_conv_b = get_tensor(string_format(TN_A_GEN_WAV_PRE_CONV, "bias"));
+                            c2w.pre_conv_w = get_tensor(string_format(TN_A_GEN_WAV_PRE_CONV, "weight"));
+                            c2w.pre_conv_b = get_tensor(string_format(TN_A_GEN_WAV_PRE_CONV, "bias"));
 
-                        c2w.tfm_in_proj_w     = get_tensor(string_format(TN_A_GEN_WAV_TFM_IN_PROJ,  "weight"));
-                        c2w.tfm_in_proj_b     = get_tensor(string_format(TN_A_GEN_WAV_TFM_IN_PROJ,  "bias"));
-                        c2w.tfm_out_proj_w    = get_tensor(string_format(TN_A_GEN_WAV_TFM_OUT_PROJ, "weight"));
-                        c2w.tfm_out_proj_b    = get_tensor(string_format(TN_A_GEN_WAV_TFM_OUT_PROJ, "bias"));
+                            c2w.tfm_in_proj_w  = get_tensor(string_format(TN_A_GEN_WAV_TFM_IN_PROJ,  "weight"));
+                            c2w.tfm_in_proj_b  = get_tensor(string_format(TN_A_GEN_WAV_TFM_IN_PROJ,  "bias"));
+                            c2w.tfm_out_proj_w = get_tensor(string_format(TN_A_GEN_WAV_TFM_OUT_PROJ, "weight"));
+                            c2w.tfm_out_proj_b = get_tensor(string_format(TN_A_GEN_WAV_TFM_OUT_PROJ, "bias"));
+                        }
                         c2w.tfm_output_norm_w = get_tensor(string_format(TN_A_GEN_WAV_TFM_OUT_NORM, "weight"));
 
                         // loaded manually, the generic model.layers loop is taken by code_predictor
@@ -4581,6 +4626,7 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
                 n_patches = 1;
             } break;
         case PROJECTOR_TYPE_QWEN3TTS_GEN:
+        case PROJECTOR_TYPE_QWEN3OMNI_GEN:
             {
                 // one hidden-state vector fed back to the talker per call
                 n_patches = 1;
@@ -4644,7 +4690,8 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
 // persisted state slots of the gen-audio decoder, per pipeline
 static std::vector<c2w_state_slot> list_gen_state_slots(const clip_hparams & hparams, const clip_model & model) {
     switch (model.proj_type) {
-        case PROJECTOR_TYPE_QWEN3TTS_GEN:  return list_c2w_state_slots(hparams, model);
+        case PROJECTOR_TYPE_QWEN3TTS_GEN:
+        case PROJECTOR_TYPE_QWEN3OMNI_GEN: return list_c2w_state_slots(hparams, model);
         case PROJECTOR_TYPE_POCKETTTS_GEN: return list_pockettts_state_slots(hparams, model);
         default:                           return {};
     }
@@ -4818,8 +4865,8 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         }
         set_input_f32("inp_raw", inp_raw);
 
-    } else if (params->gen_process != CLIP_GEN_PROCESS_GEN_WAV) {
-        // audio input. GEN_WAV is not here: it takes codes or feats, set in the switch below
+    } else if (params->gen_process != CLIP_GEN_PROCESS_GEN_WAV && params->gen_process != CLIP_GEN_PROCESS_GEN_COND) {
+        // audio input. GEN_WAV and GEN_COND are not here: they take codes, feats or rows, set in the switch below
         GGML_ASSERT(imgs.entries.size() == 1);
 
         const auto & mel_inp = imgs.entries[0];
@@ -5530,19 +5577,25 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 // do nothing
             } break;
         case PROJECTOR_TYPE_QWEN3TTS_GEN:
+        case PROJECTOR_TYPE_QWEN3OMNI_GEN:
             {
-                if (params->gen_process == CLIP_GEN_PROCESS_GEN_WAV) {
+                if (params->gen_process == CLIP_GEN_PROCESS_GEN_COND) {
+                    GGML_ASSERT(params->cond != nullptr && model.gen_cond_fc1_w != nullptr);
+                    set_input_f32("inp_cond", *params->cond);
+                } else if (params->gen_process == CLIP_GEN_PROCESS_GEN_WAV) {
                     GGML_ASSERT(params->codes != nullptr);
 
-                    // frame-major input to group-major, rear-padded with code 0 up to one window
+                    // frame-major input to group-major; the graph is sized to exactly these frames,
+                    // so the persisted state continues from the last real frame
                     const int64_t n_codes  = model.gen_code_head_w->ne[2] + 1;
                     const int64_t n_frames_w = hparams.wav_tfm_swa;
                     const int64_t n_frames   = (int64_t) params->codes->size() / n_codes;
                     GGML_ASSERT(n_frames > 0 && n_frames <= n_frames_w);
 
                     // codes are used as ggml_get_rows indices, so check them against the codebook vocab
-                    const int64_t vocab_first = model.c2w.quant_first_cb_w->ne[1];
-                    const int64_t vocab_rest  = model.c2w.quant_rest_cb_w->ne[1];
+                    const bool    averaged    = model.c2w.code_embd_w != nullptr;
+                    const int64_t vocab_first = averaged ? model.c2w.code_embd_w->ne[1] / n_codes : model.c2w.quant_first_cb_w->ne[1];
+                    const int64_t vocab_rest  = averaged ? vocab_first : model.c2w.quant_rest_cb_w->ne[1];
                     for (int64_t f = 0; f < n_frames; f++) {
                         for (int64_t g = 0; g < n_codes; g++) {
                             const int32_t c = (*params->codes)[f * n_codes + g];
@@ -5555,10 +5608,11 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                         }
                     }
 
-                    std::vector<int32_t> codes(n_frames_w * n_codes, 0);
+                    std::vector<int32_t> codes(n_frames * n_codes, 0);
                     for (int64_t f = 0; f < n_frames; f++) {
                         for (int64_t g = 0; g < n_codes; g++) {
-                            codes[g * n_frames_w + f] = (*params->codes)[f * n_codes + g];
+                            // the averaged table holds every codebook, each at its own row offset
+                            codes[g * n_frames + f] = (*params->codes)[f * n_codes + g] + (averaged ? (int32_t) (g * vocab_first) : 0);
                         }
                     }
                     set_input_i32("inp_codes", codes);
@@ -6083,15 +6137,14 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         auto & out_audio = *params->out_audio;
         out_audio.resize(ggml_nelements(audio));
         ggml_backend_tensor_get(audio, out_audio.data(), 0, ggml_nbytes(audio));
-
-        // drop the tail audio that comes from the code-0 rear padding
-        const int64_t n_codes    = params->codes ? model.gen_code_head_w->ne[2] + 1 : 0;
-        const int64_t n_frames_w = hparams.wav_tfm_swa;
-        const int64_t n_frames   = params->codes ? (int64_t) params->codes->size() / n_codes : n_frames_w;
-        if (n_frames < n_frames_w) {
-            const size_t hop = out_audio.size() / n_frames_w;
-            out_audio.resize((size_t) n_frames * hop);
+    }
+    if (params->gen_process == CLIP_GEN_PROCESS_GEN_COND && params->out_feats != nullptr) {
+        ggml_tensor * cond = ggml_graph_get_tensor(gf, "out_cond");
+        if (cond == nullptr) {
+            GGML_ABORT("conditioning requested but graph has no \"out_cond\" tensor");
         }
+        params->out_feats->resize(ggml_nelements(cond));
+        ggml_backend_tensor_get(cond, params->out_feats->data(), 0, ggml_nbytes(cond));
     }
     if (params->state_out != nullptr) {
         auto & state_out = *params->state_out;
@@ -6277,6 +6330,7 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_QWEN3TTS_SPKENC:
             return ctx->model.mm_fc_w->ne[2];
         case PROJECTOR_TYPE_QWEN3TTS_GEN:
+        case PROJECTOR_TYPE_QWEN3OMNI_GEN:
             return ctx->model.gen_code_out_embd_w->ne[0];
         case PROJECTOR_TYPE_POCKETTTS_SPKENC:
             return ctx->model.spk_proj_w->ne[1];
@@ -6287,6 +6341,10 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         default:
             GGML_ABORT("Unknown projector type");
     }
+}
+
+int clip_gen_cond_n_in(const struct clip_ctx * ctx) {
+    return ctx->model.gen_cond_fc1_w ? (int) ctx->model.gen_cond_fc1_w->ne[0] : 0;
 }
 
 bool clip_is_llava(const struct clip_ctx * ctx) {

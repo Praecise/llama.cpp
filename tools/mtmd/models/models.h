@@ -259,12 +259,23 @@ struct clip_graph_qwen3tts_spkenc : clip_graph {
 };
 
 struct clip_graph_qwen3tts_gen : clip_graph {
-    clip_graph_qwen3tts_gen(clip_ctx * ctx, const clip_image_f32 & img, clip_gen_process_type gen_process, int top_k, float top_p)
-        : clip_graph(ctx, img), gen_process(gen_process), top_k(top_k), top_p(top_p) {}
+    clip_graph_qwen3tts_gen(clip_ctx * ctx, const clip_image_f32 & img, clip_gen_process_type gen_process, int top_k, float top_p,
+                            int n_frames, int n_cond, bool cold)
+        : clip_graph(ctx, img), gen_process(gen_process), n_frames(n_frames), n_cond(n_cond), cold(cold), top_k(top_k), top_p(top_p) {}
     ggml_cgraph * build() override;
 
     // which sub-graph build() constructs, fixed at graph-build time
     clip_gen_process_type gen_process;
+
+    // GEN_WAV: frames decoded by this call (at most one attention window)
+    int n_frames;
+    // GEN_COND: rows mapped by this call
+    int n_cond;
+    // GEN_WAV: the first call of a stream (no state carried in)
+    bool cold;
+
+    // GEN_COND: reading-model hidden states -> backbone-width rows
+    ggml_cgraph * build_cond();
 
     // sampling params, fixed at graph-build time (GEN_CODE only)
     int   top_k;
@@ -320,7 +331,10 @@ struct clip_graph_qwen3tts_gen : clip_graph {
     // code2wav: RVQ codes -> raw PCM (quantizer + pre_conv + pre_transformer + upsample + DAC).
     //
     struct code2wav : clip_graph {
-        code2wav(const clip_graph & parent) : clip_graph(parent) {}
+        code2wav(const clip_graph & parent, bool cold) : clip_graph(parent), cold(cold) {}
+
+        // the first call of a stream: transposed convolutions drop their leading overlap
+        bool cold;
         ggml_cgraph * build() override { GGML_ABORT("call decode() instead"); }
 
         // state_in: previous call's persisted state, by slot name (see list_c2w_state_slots())
@@ -335,6 +349,7 @@ struct clip_graph_qwen3tts_gen : clip_graph {
         ggml_tensor * snake(ggml_tensor * x, ggml_tensor * alpha, ggml_tensor * beta) const;
 
         ggml_tensor * quant_decode(ggml_tensor * inp_codes) const;
+        ggml_tensor * code_embd_mean(ggml_tensor * inp_codes) const;
         ggml_tensor * tfm_layer_forward(ggml_tensor * cur, const clip_layer & layer, int il) const;
         ggml_tensor * convnext_block(ggml_tensor * x, const clip_code2wav::upsample_block & blk, const std::string & state_prefix) const;
         ggml_tensor * dac_res_unit(ggml_tensor * x, const clip_code2wav::dac_res & res, int dilation, const std::string & state_name) const;
