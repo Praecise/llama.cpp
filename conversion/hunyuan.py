@@ -489,6 +489,12 @@ class HunyuanImage3Model(TextModel):
                 self.rope_parameters.pop(k, None)
         if self.hparams.get("rope_type", "2d") != "2d":
             raise ValueError(f"HunyuanImage 3.0 rope_type {self.hparams.get('rope_type')} is not supported")
+        # Group-limited routing is off in this family (stored as false).
+        for k in ("n_group", "topk_group"):
+            if not self.hparams.get(k):
+                self.hparams.pop(k, None)
+        if isinstance(self.hparams.get("num_experts"), list):
+            raise ValueError("per-layer expert counts are not supported")
         self._image_side: dict[str, Tensor] = {}
         self._experts: list[dict[str, Tensor]] | None = None
 
@@ -515,9 +521,9 @@ class HunyuanImage3Model(TextModel):
         super().set_gguf_parameters()
         hp = self.hparams
         hd = self._head_dim()
-        self.gguf_writer.add_key_length(hd)
-        self.gguf_writer.add_value_length(hd)
-        self.gguf_writer.add_layer_norm_rms_eps(hp["rms_norm_eps"])
+        if hp.get("head_dim") is None:
+            self.gguf_writer.add_key_length(hd)
+            self.gguf_writer.add_value_length(hd)
 
         def same(key):
             v = hp[key]
@@ -527,7 +533,6 @@ class HunyuanImage3Model(TextModel):
             return v
 
         moe_ff = same("moe_intermediate_size")
-        self.gguf_writer.add_expert_count(same("num_experts"))
         self.gguf_writer.add_expert_used_count(same("moe_topk"))
         self.gguf_writer.add_expert_feed_forward_length(moe_ff)
         n_shared = same("num_shared_expert")
@@ -535,7 +540,6 @@ class HunyuanImage3Model(TextModel):
         self.gguf_writer.add_expert_shared_feed_forward_length(moe_ff * n_shared)
         quarter = hd // 4
         self.gguf_writer.add_rope_dimension_sections([quarter, quarter, 0, 0])
-        self.gguf_writer.add_rope_freq_base(float(hp.get("rope_theta", 10000.0)))
 
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
         hd = self._head_dim()
