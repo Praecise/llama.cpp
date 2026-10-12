@@ -550,7 +550,7 @@ ggml_tensor * clip_graph_qwen3tts_gen::code2wav::convnext_block(ggml_tensor * x,
 
     ggml_tensor * g = ggml_mul_mat(ctx0, blk.pw1_w, hc);
     g = ggml_add(ctx0, g, blk.pw1_b);
-    g = ggml_gelu(ctx0, g);
+    g = ggml_gelu_erf(ctx0, g); // the reference's nn.GELU() is the exact (erf) form
     g = ggml_mul_mat(ctx0, blk.pw2_w, g);
     g = ggml_add(ctx0, g, blk.pw2_b);
     g = ggml_mul(ctx0, g, blk.gamma);
