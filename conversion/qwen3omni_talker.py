@@ -321,8 +321,11 @@ class Qwen3OmniTalkerGenModel(MmprojModel):
     @staticmethod
     def _snake(name: str, data: Tensor) -> Tensor:
         # SnakeBeta keeps alpha and beta in log scale; fold exp() and the reciprocal here
-        if name.endswith(".alpha"):
+        leaf = name.rsplit(".", 1)[-1]
+        if leaf == "alpha":
             return torch.exp(data.float())
+        if leaf != "beta":
+            raise ValueError(f"not a SnakeBeta parameter: {name}")
         return 1.0 / (torch.exp(data.float()) + 1e-9)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
