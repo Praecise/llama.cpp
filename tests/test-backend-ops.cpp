@@ -4313,12 +4313,14 @@ struct test_snake_fuse : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR2(type, ne);
+        return VARS_TO_STR3(type, ne, alpha);
     }
 
+    const float alpha; // a uniform in [-alpha, alpha]; decoders carry alphas in the tens
+
     test_snake_fuse(ggml_type type = GGML_TYPE_F32,
-            std::array<int64_t, 4> ne = {256, 192, 1, 1})
-        : type(type), ne(ne) {}
+            std::array<int64_t, 4> ne = {256, 192, 1, 1}, float alpha = 1.0f)
+        : type(type), ne(ne), alpha(alpha) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_4d(ctx, type, ne[0], ne[1], ne[2], ne[3]);
@@ -4347,6 +4349,8 @@ struct test_snake_fuse : public test_case {
             const std::string name = ggml_get_name(t);
             if (name == "x") {
                 init_tensor_uniform(t, -3.14159f, 3.14159f);
+            } else if (name == "a") {
+                init_tensor_uniform(t, -alpha, alpha);
             } else {
                 init_tensor_uniform(t);
             }
@@ -5848,14 +5852,16 @@ struct test_log : public test_case {
 struct test_sin : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
+    const float range; // arguments uniform in [-range, range]
+    const double err;
 
     std::string vars() override {
-        return VARS_TO_STR2(type, ne);
+        return VARS_TO_STR3(type, ne, range);
     }
 
     test_sin(ggml_type type = GGML_TYPE_F32,
-            std::array<int64_t, 4> ne = {10, 2, 2, 2})
-        : type(type), ne(ne) {}
+            std::array<int64_t, 4> ne = {10, 2, 2, 2}, float range = 6.5f, double err = 1e-3)
+        : type(type), ne(ne), range(range), err(err) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
@@ -5870,12 +5876,12 @@ struct test_sin : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            init_tensor_uniform(t, -6.5f, 6.5f); // Covers interval [-2*pi, 2*pi].
+            init_tensor_uniform(t, -range, range); // the default covers [-2*pi, 2*pi]
         }
     }
 
     double max_maa_err() override {
-        return 1e-3;
+        return err;
     }
 
     float grad_eps() override {
@@ -5891,14 +5897,16 @@ struct test_sin : public test_case {
 struct test_cos : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
+    const float range; // arguments uniform in [-range, range]
+    const double err;
 
     std::string vars() override {
-        return VARS_TO_STR2(type, ne);
+        return VARS_TO_STR3(type, ne, range);
     }
 
     test_cos(ggml_type type = GGML_TYPE_F32,
-            std::array<int64_t, 4> ne = {10, 2, 2, 2})
-        : type(type), ne(ne) {}
+            std::array<int64_t, 4> ne = {10, 2, 2, 2}, float range = 6.5f, double err = 1e-3)
+        : type(type), ne(ne), range(range), err(err) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
@@ -5913,12 +5921,12 @@ struct test_cos : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            init_tensor_uniform(t, -6.5f, 6.5f); // Covers interval [-2*pi, 2*pi].
+            init_tensor_uniform(t, -range, range); // the default covers [-2*pi, 2*pi]
         }
     }
 
     double max_maa_err() override {
-        return 1e-3;
+        return err;
     }
 
     float grad_eps() override {
@@ -10440,6 +10448,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_snake_fuse(type, {1025,  13, 1, 1}));   // large prime, grid-stride
         test_cases.emplace_back(new test_snake_fuse(type, { 128,  16, 1, 1}));   // power-of-two
         test_cases.emplace_back(new test_snake_fuse(type, { 256, 192, 1, 1}));   // BigVGAN-ish
+        if (type == GGML_TYPE_F32) {
+            test_cases.emplace_back(new test_snake_fuse(type, { 256, 192, 1, 1}, 60.0f)); // large alphas
+        }
         // higher-rank shapes: matcher must reject fusion, fallback to naive chain
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 2, 1}));   // ne[2] > 1
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 1, 2}));   // ne[3] > 1
@@ -11894,6 +11905,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_sin       (type, {1024, 1024, 1, 1}));
         test_cases.emplace_back(new test_cos       (type, {7, 1, 5, 3}));
         test_cases.emplace_back(new test_cos       (type, {1024, 1024, 1, 1}));
+        if (type == GGML_TYPE_F32) {
+            // arguments far from zero, as a SnakeBeta decoder produces
+            test_cases.emplace_back(new test_sin   (type, {256, 64, 1, 1}, 400.0f, 1e-5));
+            test_cases.emplace_back(new test_cos   (type, {256, 64, 1, 1}, 400.0f, 1e-5));
+        }
         test_cases.emplace_back(new test_clamp     (type, {7, 1, 5, 3}));
         test_cases.emplace_back(new test_clamp     (type, {1024, 1024, 1, 1}));
         test_cases.emplace_back(new test_leaky_relu(type, {7, 1, 5, 3}));
