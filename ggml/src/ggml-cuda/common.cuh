@@ -1485,7 +1485,7 @@ struct ggml_backend_cuda_context {
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {0};
 
-    // F32 cuBLAS products in full FP32 rather than with TF32 tensor-op rounding (a training context)
+    // F32 cuBLAS products in full FP32 rather than with TF32 tensor-op rounding (ggml_backend_set_fp32_gemm)
     bool fp32_gemm = false;
 
     int curr_stream_no = 0;

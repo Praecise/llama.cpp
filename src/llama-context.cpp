@@ -1299,6 +1299,22 @@ void llama_context::set_warmup(bool value) {
     //sched_need_reserve = true;
 }
 
+void llama_context::set_fp32_gemm(bool value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+
+    for (auto & backend : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+        if (dev == nullptr) {
+            continue;
+        }
+        auto set_fp32_gemm = (void (*)(ggml_backend_t, bool))
+            ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_set_fp32_gemm");
+        if (set_fp32_gemm) {
+            set_fp32_gemm(backend.get(), value);
+        }
+    }
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -3836,17 +3852,7 @@ int32_t llama_context::opt_grad_init(struct llama_model * model, enum ggml_opt_l
 
     // a gradient is computed in FP32: a backend that rounds F32 products to a narrower format by
     // default (TF32 tensor ops) computes them in full FP32 for this context
-    for (auto & backend : backends) {
-        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
-        if (dev == nullptr) {
-            continue;
-        }
-        auto set_fp32_gemm = (void (*)(ggml_backend_t, bool))
-            ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_set_fp32_gemm");
-        if (set_fp32_gemm) {
-            set_fp32_gemm(backend.get(), true);
-        }
-    }
+    set_fp32_gemm(true);
 
     // size the graphs and the scheduler for gradient graphs before the optimizer context takes the scheduler
     opt_grad_graphs    = true;
@@ -4457,6 +4463,10 @@ bool llama_get_causal_attn(const llama_context * ctx) {
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {
     ctx->set_warmup(warmup);
+}
+
+void llama_set_fp32_gemm(llama_context * ctx, bool fp32_gemm) {
+    ctx->set_fp32_gemm(fp32_gemm);
 }
 
 void llama_synchronize(llama_context * ctx) {

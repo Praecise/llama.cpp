@@ -1173,6 +1173,10 @@ extern "C" {
     // Returns whether the context is currently using causal attention
     LLAMA_API bool llama_get_causal_attn(const struct llama_context * ctx);
 
+    // Set whether F32 matrix products run in full FP32 on backends that otherwise round them
+    // to a narrower format (TF32 tensor ops on CUDA); no effect on other backends. Default: false
+    LLAMA_API void llama_set_fp32_gemm(struct llama_context * ctx, bool fp32_gemm);
+
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
     //

@@ -2059,13 +2059,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
 // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
-static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
+static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc, const bool fp32_gemm) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
     // same gate as ggml_cuda_mul_mat_id: a pedantic F32 request never takes the mmf path
     const bool f32_pedantic = src0->type == GGML_TYPE_F32 &&
         ggml_prec(dst->op_params[0]) == GGML_PREC_F32_PEDANTIC;
+    const bool tf32_ok = !(fp32_gemm && src0->type == GGML_TYPE_F32);
 
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return true;
@@ -2085,7 +2086,7 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         return false;
     }
 
-    if (!f32_pedantic && ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+    if (!f32_pedantic && tf32_ok && ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
         return false;
     }
 
@@ -2105,6 +2106,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const bool f32_pedantic = src0->type == GGML_TYPE_F32 &&
         ggml_prec(dst->op_params[0]) == GGML_PREC_F32_PEDANTIC;
+    // the F32 tensor-core kernel rounds its inputs to TF32: a context computing in full FP32 uses cuBLAS
+    const bool tf32_ok = !(ctx.fp32_gemm && src0->type == GGML_TYPE_F32);
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -2129,7 +2132,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             return;
         }
 
-        if (!f32_pedantic && ggml_cuda_should_use_mmf(
+        if (!f32_pedantic && tf32_ok && ggml_cuda_should_use_mmf(
                 src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
             return;
@@ -2137,7 +2140,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     }
 
     // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
-    GGML_ASSERT(ggml_cuda_mul_mat_id_needs_sync(dst, cc));
+    GGML_ASSERT(ggml_cuda_mul_mat_id_needs_sync(dst, cc, ctx.fp32_gemm));
     cudaStream_t stream = ctx.stream();
 
     GGML_ASSERT(nb12 % nb11 == 0);
@@ -2755,7 +2758,7 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 }
 
 #ifdef USE_CUDA_GRAPH
-static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph, const bool fp32_gemm) {
 
     bool use_cuda_graph = true;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
@@ -2770,7 +2773,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-            if (ggml_cuda_mul_mat_id_needs_sync(node, cc)) {
+            if (ggml_cuda_mul_mat_id_needs_sync(node, cc, fp32_gemm)) {
                 // the mul_mat_id fallback path synchronizes the stream, so we cannot use CUDA graphs
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
                 use_cuda_graph = false;
@@ -4812,7 +4815,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
-        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph, cuda_ctx->fp32_gemm);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
@@ -6167,7 +6170,16 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 static void ggml_backend_cuda_set_fp32_gemm(ggml_backend_t backend, bool fp32) {
     GGML_ASSERT(ggml_backend_is_cuda(backend));
     ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    if (ctx->fp32_gemm == fp32) {
+        return;
+    }
     ctx->fp32_gemm = fp32;
+#ifdef USE_CUDA_GRAPH
+    // a captured graph holds the kernels chosen under the previous setting
+    ggml_cuda_set_device(ctx->device);
+    CUDA_CHECK(cudaStreamSynchronize(ctx->stream()));
+    ctx->cuda_graphs.clear();
+#endif // USE_CUDA_GRAPH
     for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
         for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
             if (ctx->cublas_handles[d][s] != nullptr) {
