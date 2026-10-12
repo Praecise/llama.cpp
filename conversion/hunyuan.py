@@ -498,6 +498,13 @@ class HunyuanImage3Model(TextModel):
         self._image_side: dict[str, Tensor] = {}
         self._experts: list[dict[str, Tensor]] | None = None
 
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        # The text model's multimodal filter drops "patch_embed" names; here that is the image head.
+        if item[0].startswith(cls.image_side_prefixes):
+            return ModelBase.filter_tensors.__func__(cls, item)
+        return super().filter_tensors(item)
+
     def set_vocab(self):
         if (self.dir_model / "tokenizer.json").is_file():
             self._set_vocab_gpt2()
@@ -562,6 +569,10 @@ class HunyuanImage3Model(TextModel):
         if name.startswith(self.skipped_prefixes):
             return
 
+        if name == self.format_tensor_name(T.ROPE_FREQS):
+            # from generate_extra_tensors, already named
+            yield (name, data_torch)
+            return
         if name == "model.wte.weight":
             yield (self.format_tensor_name(T.TOKEN_EMBD), data_torch)
             return
