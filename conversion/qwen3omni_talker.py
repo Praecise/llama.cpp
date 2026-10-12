@@ -289,8 +289,9 @@ class Qwen3OmniTalkerGenModel(MmprojModel):
         w.add_gen_audio_wav_decoder_block_count(len(wav["upsample_rates"]))
 
     def tensor_force_quant(self, name, new_name, bid, n_dims):
-        # conv1d/conv1d_dw kernels must be F16, ggml_conv_1d(_dw) has no BF16 path
-        if new_name.endswith(".weight") and (
+        # conv1d/conv1d_dw kernels: ggml_conv_1d(_dw) has no BF16 path, so a BF16 or quantized
+        # export stores them F16; an F32 export keeps them F32
+        if self.ftype != gguf.LlamaFileType.ALL_F32 and new_name.endswith(".weight") and (
             new_name in ("a.gen.wav.dac.entry.weight", "a.gen.wav.dac.post_conv.weight")
             or (".up.blk." in new_name and new_name.endswith(".dwconv.weight"))
             or (".dac.blk." in new_name and (new_name.endswith(".conv1.weight") or new_name.endswith(".conv2.weight")))
