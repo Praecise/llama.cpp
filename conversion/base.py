@@ -216,6 +216,13 @@ class ModelBase:
             return None
         raise KeyError(f"could not find any of: {keys}")
 
+    def needs_tensor(self, name: str) -> bool:
+        """Whether the conversion needs the checkpoint tensor `name`. A class that
+        converts one part of a checkpoint narrows this, so a local copy holding only
+        that part (some shards, or shards trimmed to its tensors) indexes cleanly."""
+        del name
+        return True
+
     def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
         tensors: dict[str, Callable[[], Tensor]] = {}
 
@@ -308,9 +315,10 @@ class ModelBase:
         # An MTP-only export deliberately carries a fraction of the index, so the
         # leftover-tensor warning is noise there, not a problem.
         if not self.mtp_only and len(tensor_names_from_index) > 0:
-            if len(tensor_names_from_parts.symmetric_difference(tensor_names_from_index)) > 0:
-                missing = sorted(tensor_names_from_index.difference(tensor_names_from_parts))
-                extra = sorted(tensor_names_from_parts.difference(tensor_names_from_index))
+            missing = sorted(n for n in tensor_names_from_index.difference(tensor_names_from_parts)
+                             if self.needs_tensor(n))
+            extra = sorted(tensor_names_from_parts.difference(tensor_names_from_index))
+            if missing or extra:
                 missing_files = sorted(set(weight_map[n] for n in missing if n in weight_map))
                 if len(extra) == 0 and len(missing_files) > 0:
                     raise ValueError(f"Missing or incomplete model files: {missing_files}\n"

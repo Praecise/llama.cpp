@@ -151,6 +151,12 @@ class Qwen3OmniTalkerModel(Qwen2MoeModel):
         for key in ("audio_token_id", "image_token_id", "video_token_id"):
             self.gguf_writer.add_uint32(f"{arch}.{key}", int(self._talker_config[key]))
 
+    def needs_tensor(self, name: str) -> bool:
+        # the talker, and the thinker's token embedding it folds; not the rest of the thinker
+        return name == "thinker.model.embed_tokens.weight" or (
+            name.startswith("talker.") and not name.startswith(("talker.code_predictor.", "talker.hidden_projection."))
+        )
+
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
         name, gen = item
@@ -297,6 +303,10 @@ class Qwen3OmniTalkerGenModel(MmprojModel):
         if new_name.startswith(("a.gen.wav.code_embd", "a.gen.cond.")):
             return gguf.GGMLQuantizationType.F32
         return super().tensor_force_quant(name, new_name, bid, n_dims)
+
+    def needs_tensor(self, name: str) -> bool:
+        return name.startswith(("talker.code_predictor.", "talker.hidden_projection.", "code2wav.")) \
+            or name == "talker.model.codec_embedding.weight"
 
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
