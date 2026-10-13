@@ -446,6 +446,11 @@ MTMD_API int32_t mtmd_gen_audio_process(mtmd_context * ctx,
 
 /////////////////////////////////////////
 
+// Set whether F32 matrix products of every encoder and generator of this context run in full FP32
+// on backends that otherwise round them to a narrower format (TF32 tensor ops on CUDA), as
+// llama_set_fp32_gemm does for a llama context. Default: false
+MTMD_API void mtmd_set_fp32_gemm(mtmd_context * ctx, bool fp32);
+
 // test function, to be used in test-mtmd-c-api.c
 MTMD_API mtmd_input_chunks * mtmd_test_create_input_chunks(void);
 

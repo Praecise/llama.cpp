@@ -126,6 +126,9 @@ struct clip_encode_params {
 };
 bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params);
 
+// F32 matrix products in full FP32 on this context's backends, see mtmd_set_fp32_gemm
+void clip_set_fp32_gemm(struct clip_ctx * ctx, bool fp32);
+
 // width of the rows GEN_COND takes, 0 when the projector has no conditioning MLP
 int clip_gen_cond_n_in(const struct clip_ctx * ctx);
 

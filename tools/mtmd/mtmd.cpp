@@ -2050,6 +2050,14 @@ float * mtmd_get_output_embd(mtmd_context * ctx) {
 // audio generation
 //
 
+void mtmd_set_fp32_gemm(mtmd_context * ctx, bool fp32) {
+    for (clip_ctx * c : { ctx->ctx_v, ctx->ctx_a, ctx->ctx_gen_a }) {
+        if (c) {
+            clip_set_fp32_gemm(c, fp32);
+        }
+    }
+}
+
 mtmd_gen_audio_info mtmd_gen_audio_get_info(const mtmd_context * ctx) {
     mtmd_gen_audio_info info{};
     info.model_variant = "";

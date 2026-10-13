@@ -6343,6 +6343,17 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
     }
 }
 
+void clip_set_fp32_gemm(struct clip_ctx * ctx, bool fp32) {
+    for (ggml_backend_t backend : ctx->backend_ptrs) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        auto set_fp32_gemm = dev ? (void (*)(ggml_backend_t, bool))
+            ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_set_fp32_gemm") : nullptr;
+        if (set_fp32_gemm) {
+            set_fp32_gemm(backend, fp32);
+        }
+    }
+}
+
 int clip_gen_cond_n_in(const struct clip_ctx * ctx) {
     return ctx->model.gen_cond_fc1_w ? (int) ctx->model.gen_cond_fc1_w->ne[0] : 0;
 }
