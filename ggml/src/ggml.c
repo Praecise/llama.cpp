@@ -4637,7 +4637,9 @@ struct ggml_tensor * ggml_conv_1d(
         int                   s0,
         int                   p0,
         int                   d0) {
-    struct ggml_tensor * im2col = ggml_im2col(ctx, a, b, s0, 0, p0, 0, d0, 0, false, a->type == GGML_TYPE_BF16 ? GGML_TYPE_F32 : GGML_TYPE_F16); // [N, OL, IC * K]
+    // an F16 kernel takes F16 columns; any other kernel keeps them in F32, so an F32 convolution is an
+    // F32 product on every backend (F16 columns would make it an F16 product, accumulated in F16 by cuBLAS)
+    struct ggml_tensor * im2col = ggml_im2col(ctx, a, b, s0, 0, p0, 0, d0, 0, false, a->type == GGML_TYPE_F16 ? GGML_TYPE_F16 : GGML_TYPE_F32); // [N, OL, IC * K]
 
     struct ggml_tensor * result =
         ggml_mul_mat(ctx,
@@ -4671,7 +4673,8 @@ struct ggml_tensor * ggml_conv_1d_dw(
         int                   d0) {
     struct ggml_tensor * new_b = ggml_reshape_4d(ctx, b, b->ne[0], 1, b->ne[1], b->ne[2]);
 
-    struct ggml_tensor * im2col = ggml_im2col(ctx, a, new_b, s0, 0, p0, 0, d0, 0, false, a->type == GGML_TYPE_BF16 ? GGML_TYPE_F32 : GGML_TYPE_F16);
+    // F16 columns only for an F16 kernel, as in ggml_conv_1d
+    struct ggml_tensor * im2col = ggml_im2col(ctx, a, new_b, s0, 0, p0, 0, d0, 0, false, a->type == GGML_TYPE_F16 ? GGML_TYPE_F16 : GGML_TYPE_F32);
 
     struct ggml_tensor * result = ggml_mul_mat(ctx, im2col, a);
 
