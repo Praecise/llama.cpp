@@ -3937,8 +3937,9 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
             (float *)C, ldc};
         return tb.matmul(m, n);
 #elif defined(__ARM_NEON)
-        if (n < 4)
-            return false;
+        // No small-n exception, as on x86: a product of n = 2 or 3 columns
+        // handed to vec_dot instead sums in a different order, so a row of
+        // the result would depend on how many columns share the batch.
         tinyBLAS<4, float32x4_t, float32x4_t, float, float, float> tb{ params,
             k, (const float *)A, lda,
             (const float *)B, ldb,
