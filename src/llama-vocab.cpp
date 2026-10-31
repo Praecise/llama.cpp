@@ -3040,9 +3040,6 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                 } else {
                     throw std::runtime_error(format("unknown metaspace prepend_scheme: '%s'", scheme.c_str()));
                 }
-                if (type == LLAMA_VOCAB_TYPE_BPE && metaspace_prepend_scheme == LLAMA_METASPACE_PREPEND_SCHEME_ALWAYS) {
-                    throw std::runtime_error("metaspace prepend_scheme 'always' is not supported for BPE vocab");
-                }
             }
         }
 
@@ -3913,6 +3910,12 @@ std::vector<llama_token> llama_vocab::impl::tokenize(
                         static const std::string escaped_space = "\xE2\x96\x81";
                         if (metaspace_prepend_scheme == LLAMA_METASPACE_PREPEND_SCHEME_FIRST &&
                             &fragment == &fragment_buffer.front() && text.rfind(escaped_space, 0) != 0) {
+                            text.insert(0, escaped_space);
+                        }
+                        // Metaspace prepend_scheme "always": every run of text between special tokens
+                        // is a pre-tokenizer input of its own and starts with U+2581
+                        if (metaspace_prepend_scheme == LLAMA_METASPACE_PREPEND_SCHEME_ALWAYS &&
+                            !text.empty() && text.rfind(escaped_space, 0) != 0) {
                             text.insert(0, escaped_space);
                         }
 
