@@ -10,7 +10,6 @@
 #include "llama-cpp.h"
 
 #include "../src/llama-arch.h"
-#include "../src/llama-model-saver.h"
 
 #include <algorithm>
 #include <cmath>
@@ -47,6 +46,18 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
     ggml_backend_tensor_set(tensor, q.data(), 0, q.size());
 }
 
+// writes arch-resolved GGUF keys into the fixture context
+struct kv_writer {
+    struct gguf_context * gguf_ctx;
+    const LLM_KV          llm_kv;
+
+    kv_writer(llm_arch arch, struct gguf_context * gguf_ctx) : gguf_ctx(gguf_ctx), llm_kv(arch) {}
+
+    void add_kv(enum llm_kv key, uint32_t     value) { gguf_set_val_u32(gguf_ctx, llm_kv(key).c_str(), value); }
+    void add_kv(enum llm_kv key, float        value) { gguf_set_val_f32(gguf_ctx, llm_kv(key).c_str(), value); }
+    void add_kv(enum llm_kv key, const char * value) { gguf_set_val_str(gguf_ctx, llm_kv(key).c_str(), value); }
+};
+
 static const char * LOW_PRECISION_WEIGHTS[] = {"attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_up", "ffn_down"};
 
 static bool is_low_precision_weight(const char * name) {
@@ -63,7 +74,7 @@ static bool is_low_precision_weight(const char * name) {
 // a dense model; with wtype other than F32 the attention and MLP weights are stored in that type
 static gguf_context_ptr model_metadata(uint32_t n_embd = N_EMBD, uint32_t n_ff = N_FF, ggml_type wtype = GGML_TYPE_F32) {
     gguf_context_ptr ret(gguf_init_empty());
-    llama_model_saver ms(LLM_ARCH_LLAMA, ret.get());
+    kv_writer ms(LLM_ARCH_LLAMA, ret.get());
     ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE,         llm_arch_name(LLM_ARCH_LLAMA));
     ms.add_kv(LLM_KV_VOCAB_SIZE,                   N_VOCAB);
     ms.add_kv(LLM_KV_CONTEXT_LENGTH,               N_CTX);
@@ -96,7 +107,7 @@ static gguf_context_ptr qk_norm_metadata() {
     const uint32_t n_head    = 4;
     const uint32_t head_size = 16;
     gguf_context_ptr ret(gguf_init_empty());
-    llama_model_saver ms(LLM_ARCH_QWEN3, ret.get());
+    kv_writer ms(LLM_ARCH_QWEN3, ret.get());
     ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE,         llm_arch_name(LLM_ARCH_QWEN3));
     ms.add_kv(LLM_KV_VOCAB_SIZE,                   N_VOCAB);
     ms.add_kv(LLM_KV_CONTEXT_LENGTH,               N_CTX);

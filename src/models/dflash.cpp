@@ -434,6 +434,23 @@ llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_grap
     ggml_build_forward_expand(gf, cur);
 }
 
+// target features of an injection batch: host embd rows, or rows of the target's layer input device buffer
+static ggml_tensor * build_inp_target_features(llm_graph_context & g, llm_graph_input_embd & inp, int64_t n_embd_inp) {
+    if (g.ubatch.embd_row) {
+        GGML_ASSERT(g.layer_inp_src != nullptr && g.layer_inp_src->ne[0] == n_embd_inp);
+
+        inp.embd_rows = ggml_new_tensor_1d(g.ctx0, GGML_TYPE_I32, g.n_tokens);
+        ggml_set_input(inp.embd_rows);
+
+        return ggml_get_rows(g.ctx0, g.layer_inp_src, inp.embd_rows);
+    }
+
+    inp.embd = ggml_new_tensor_2d(g.ctx0, GGML_TYPE_F32, n_embd_inp, g.n_tokens);
+    ggml_set_input(inp.embd);
+
+    return inp.embd;
+}
+
 // DSpark (DFlash + Markov & Confidence head): Markov bias on the draft logits, chained per block position
 static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens, ggml_tensor * hidden = nullptr) {
     ggml_context * ctx0 = g.ctx0;
@@ -939,13 +956,10 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     // KV cache injection
     ASSERT_EMBD_OR_TOKEN(ubatch);
-    if (ubatch.embd) {
+    if (ubatch.embd || ubatch.embd_row) {
         auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
 
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
-        ggml_set_input(inp->embd);
-
-        ggml_tensor * inp_target = inp->embd;
+        ggml_tensor * inp_target = build_inp_target_features(*this, *inp, n_embd_inp);
         cb(inp_target, "inp_target_features", -1);
 
         res->add_input(std::move(inp));
@@ -980,8 +994,8 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
                 ggml_tensor * k_idxs = is_swa ? inp_attn_iswa->get_k_idxs_swa() : inp_attn_iswa->get_k_idxs();
                 ggml_tensor * v_idxs = is_swa ? inp_attn_iswa->get_v_idxs_swa() : inp_attn_iswa->get_v_idxs();
                 // rotate K/V into the cache's rotated space
-                ggml_tensor * k_rot  = is_swa ? inp_attn_iswa->self_k_rot_swa : inp_attn_iswa->self_k_rot;
-                ggml_tensor * v_rot  = is_swa ? inp_attn_iswa->self_v_rot_swa : inp_attn_iswa->self_v_rot;
+                ggml_tensor * k_rot  = is_swa ? inp_attn_iswa->self_k_rot_swa[il] : inp_attn_iswa->self_k_rot[il];
+                ggml_tensor * v_rot  = is_swa ? inp_attn_iswa->self_v_rot_swa[il] : inp_attn_iswa->self_v_rot[il];
                 if (k_rot) {
                     Kcur = llama_mul_mat_hadamard(ctx0, Kcur, k_rot);
                 }
@@ -992,11 +1006,11 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
                 ggml_build_forward_expand(gf, kv->cpy_v(ctx0, Vcur, v_idxs, il));
             } else {
                 // rotate K/V into the cache's rotated space
-                if (inp_attn->self_k_rot) {
-                    Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_attn->self_k_rot);
+                if (inp_attn->self_k_rot[il]) {
+                    Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_attn->self_k_rot[il]);
                 }
-                if (inp_attn->self_v_rot) {
-                    Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot);
+                if (inp_attn->self_v_rot[il]) {
+                    Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot[il]);
                 }
                 ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
                 ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
@@ -1219,13 +1233,10 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
 
     // KV cache injection: fused target features from the encoder
     ASSERT_EMBD_OR_TOKEN(ubatch);
-    if (ubatch.embd) {
+    if (ubatch.embd || ubatch.embd_row) {
         auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
 
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
-        ggml_set_input(inp->embd);
-
-        ggml_tensor * inp_target = inp->embd;
+        ggml_tensor * inp_target = build_inp_target_features(*this, *inp, n_embd_inp);
         cb(inp_target, "inp_target_features", -1);
 
         res->add_input(std::move(inp));
@@ -1249,8 +1260,8 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
             kv = ggml_rope_set_offset(kv, n_embd_head_nope);
             cb(kv, "kv_injected", il);
 
-            if (inp_attn->self_k_rot_swa) {
-                kv = llama_mul_mat_hadamard(ctx0, kv, inp_attn->self_k_rot_swa);
+            if (inp_attn->self_k_rot_swa[il]) {
+                kv = llama_mul_mat_hadamard(ctx0, kv, inp_attn->self_k_rot_swa[il]);
             }
             ggml_build_forward_expand(gf, inp_attn->mctx->get_swa()->cpy_k(ctx0, kv, inp_attn->get_k_idxs_swa(), il));
         }
@@ -1292,14 +1303,12 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
         const auto & layer = model.layers[il];
 
         ggml_tensor * residual = inpL;
-        ggml_tensor * post = nullptr;
-        ggml_tensor * comb = nullptr;
-
-        ggml_tensor * cur = build_hc_pre(inpL,
+        hc_pre attn_hc = build_hc_pre(inpL,
                 layer.hc_attn_fn,
                 layer.hc_attn_scale,
                 layer.hc_attn_base,
-                &post, &comb, il);
+                il);
+        ggml_tensor * cur = attn_hc.cur;
         cb(cur, "hc_attn_pre", il);
 
         cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
@@ -1307,15 +1316,16 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
 
         cur = build_attention(model, inp_attn, cur, inp_pos, il);
 
-        inpL = build_hc_post(cur, residual, post, comb, il);
+        inpL = build_hc_post(cur, residual, attn_hc.post, attn_hc.comb, il);
         cb(inpL, "hc_attn_post", il);
 
         residual = inpL;
-        cur = build_hc_pre(inpL,
+        hc_pre ffn_hc = build_hc_pre(inpL,
                 layer.hc_ffn_fn,
                 layer.hc_ffn_scale,
                 layer.hc_ffn_base,
-                &post, &comb, il);
+                il);
+        cur = ffn_hc.cur;
         cb(cur, "hc_ffn_pre", il);
 
         cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
@@ -1344,7 +1354,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
         cb(cur, "ffn_out", il);
 
-        inpL = build_hc_post(cur, residual, post, comb, il);
+        inpL = build_hc_post(cur, residual, ffn_hc.post, ffn_hc.comb, il);
         cb(inpL, "l_out", il);
     }
 
@@ -1381,21 +1391,6 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
 //   * embd batch  -> writes every stage's kv_norm(wkv(main_proj(target features))) into its window ring
 //   * token batch -> [anchor, noise...] block through the stages, single-pass mHC, no per-head q norm
 // window of a block = window of its first query, see n_swa
-static void build_dspark_block_mask(llm_graph_context & g, llm_graph_input_attn_k_iswa * inp_attn) {
-    ggml_context * ctx0 = g.ctx0;
-
-    ggml_tensor * m = inp_attn->self_kq_mask_swa_cnv;
-    const int64_t n_tokens = g.n_tokens;
-    const int64_t n_blocks = g.ubatch.n_seqs_unq;
-    const int64_t bd       = n_blocks > 0 ? n_tokens / n_blocks : 0;
-    if (m && bd > 1 && n_tokens % n_blocks == 0 && m->ne[2] == 1 && m->ne[1] % bd == 0 && ggml_is_contiguous(m)) {
-        ggml_tensor * m4 = ggml_reshape_4d(ctx0, m, m->ne[0], bd, m->ne[1]/bd, m->ne[3]);
-        ggml_tensor * r0 = ggml_view_4d(ctx0, m4, m4->ne[0], 1, m4->ne[2], m4->ne[3], m4->nb[1], m4->nb[2], m4->nb[3], 0);
-        m4 = ggml_repeat(ctx0, r0, m4);
-        inp_attn->self_kq_mask_swa_cnv = ggml_reshape_4d(ctx0, m4, m->ne[0], m->ne[1], 1, m->ne[3]);
-        g.cb(inp_attn->self_kq_mask_swa_cnv, "dspark_block_mask", -1);
-    }
-}
 
 llama_model_dflash::graph_dsv41::graph_dsv41(const llama_model & model, const llm_graph_params & params) :
     llama_model_deepseek41::graph(params) {
@@ -1418,13 +1413,10 @@ llama_model_dflash::graph_dsv41::graph_dsv41(const llama_model & model, const ll
     };
 
     ASSERT_EMBD_OR_TOKEN(ubatch);
-    if (ubatch.embd) {
+    if (ubatch.embd || ubatch.embd_row) {
         auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
 
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
-        ggml_set_input(inp->embd);
-
-        ggml_tensor * inp_target = inp->embd;
+        ggml_tensor * inp_target = build_inp_target_features(*this, *inp, n_embd_inp);
         cb(inp_target, "inp_target_features", -1);
 
         res->add_input(std::move(inp));
@@ -1442,8 +1434,8 @@ llama_model_dflash::graph_dsv41::graph_dsv41(const llama_model & model, const ll
             kv = rope(kv);
             cb(kv, "kv_injected", il);
 
-            if (inp_attn->self_k_rot_swa) {
-                kv = llama_mul_mat_hadamard(ctx0, kv, inp_attn->self_k_rot_swa);
+            if (inp_attn->self_k_rot_swa[il]) {
+                kv = llama_mul_mat_hadamard(ctx0, kv, inp_attn->self_k_rot_swa[il]);
             }
             ggml_build_forward_expand(gf, inp_attn->mctx->get_swa()->cpy_k(ctx0, kv, inp_attn->get_k_idxs_swa(), il));
         }
@@ -1488,7 +1480,8 @@ llama_model_dflash::graph_dsv41::graph_dsv41(const llama_model & model, const ll
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
     cb(inpL, "hc_init", -1);
 
-    build_dspark_block_mask(*this, inp_attn);
+    // the whole block shares the mask row of its first query (the anchor)
+    inp_attn->self_attn_mask_swa.block_uniform = true;
 
     ggml_tensor * pre_prev = nullptr;
 
@@ -1496,10 +1489,7 @@ llama_model_dflash::graph_dsv41::graph_dsv41(const llama_model & model, const ll
         const auto & layer = model.layers[il];
 
         ggml_tensor * residual = inpL;
-        ggml_tensor * post = nullptr;
-        ggml_tensor * comb = nullptr;
-
-        ggml_tensor * attn_pre = build_hc_mixes(inpL, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base, &post, &comb, false, il);
+        const hc_mixes attn_mix = build_hc_mixes(inpL, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base, il);
 
         ggml_tensor * cur;
         if (pre_prev == nullptr) {
@@ -1554,13 +1544,14 @@ llama_model_dflash::graph_dsv41::graph_dsv41(const llama_model & model, const ll
             cb(cur, "attn_out", il);
         }
 
-        inpL = build_hc_post(cur, residual, post, comb, il);
+        inpL = build_hc_post(cur, residual, attn_mix.post, attn_mix.comb, il);
         cb(inpL, "hc_attn_post", il);
 
         residual = inpL;
-        ggml_tensor * ffn_pre = build_hc_mixes(inpL, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base, &post, &comb, false, il);
+        const hc_mixes ffn_mix = build_hc_mixes(inpL, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base, il);
+        pre_prev = ffn_mix.pre;
 
-        cur = build_hc_pre(inpL, attn_pre, il);
+        cur = build_hc_pre(inpL, attn_mix.pre, il);
         cb(cur, "hc_ffn_pre", il);
 
         cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
@@ -1589,13 +1580,11 @@ llama_model_dflash::graph_dsv41::graph_dsv41(const llama_model & model, const ll
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
         cb(cur, "ffn_out", il);
 
-        inpL = build_hc_post(cur, residual, post, comb, il);
+        inpL = build_hc_post(cur, residual, ffn_mix.post, ffn_mix.comb, il);
 
         ggml_tensor * l_out = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
         cb(l_out, "l_out", il);
         ggml_build_forward_expand(gf, l_out);
-
-        pre_prev = ffn_pre;
     }
 
     // no hc_head: collapse with the last FFN's pre-mix
@@ -1672,13 +1661,10 @@ llama_model_dflash::graph_mistral_large4::graph_mistral_large4(const llama_model
     };
 
     ASSERT_EMBD_OR_TOKEN(ubatch);
-    if (ubatch.embd) {
+    if (ubatch.embd || ubatch.embd_row) {
         auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
 
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
-        ggml_set_input(inp->embd);
-
-        ggml_tensor * inp_target = inp->embd;
+        ggml_tensor * inp_target = build_inp_target_features(*this, *inp, n_embd_inp);
         cb(inp_target, "inp_target_features", -1);
 
         res->add_input(std::move(inp));
@@ -1691,8 +1677,8 @@ llama_model_dflash::graph_mistral_large4::graph_mistral_large4(const llama_model
             ggml_tensor * kv = build_kv(inp_g, il).first;
             cb(kv, "kv_injected", il);
 
-            if (inp_attn->self_k_rot_swa) {
-                kv = llama_mul_mat_hadamard(ctx0, kv, inp_attn->self_k_rot_swa);
+            if (inp_attn->self_k_rot_swa[il]) {
+                kv = llama_mul_mat_hadamard(ctx0, kv, inp_attn->self_k_rot_swa[il]);
             }
             ggml_build_forward_expand(gf, inp_attn->mctx->get_swa()->cpy_k(ctx0, kv, inp_attn->get_k_idxs_swa(), il));
         }
@@ -1742,7 +1728,8 @@ llama_model_dflash::graph_mistral_large4::graph_mistral_large4(const llama_model
     }
     cb(inpL, "inp_noise_embd", -1);
 
-    build_dspark_block_mask(*this, inp_attn);
+    // the whole block shares the mask row of its first query (the anchor)
+    inp_attn->self_attn_mask_swa.block_uniform = true;
 
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];

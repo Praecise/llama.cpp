@@ -389,13 +389,15 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
         cb(rel, "inkling_rel_logits", il);
 
         auto * inp_attn = inp_hybrid->get_attn();
-        const int64_t n_stream = (is_swa ? inp_attn->get_kq_mask_swa() : inp_attn->get_kq_mask())->ne[3];
+        // this graph attends to the whole cache with its own masks; a row list would change their shape
+        GGML_ASSERT(inp_attn->self_attn_mask.rows == nullptr && inp_attn->self_attn_mask_swa.rows == nullptr);
+        const int64_t n_stream = (is_swa ? inp_attn->self_attn_mask_swa.raw : inp_attn->self_attn_mask.raw)->ne[3];
         GGML_ASSERT(n_tokens % n_stream == 0);
 
         if (use_banded_flash(il)) {
             GGML_ASSERT(q->type == GGML_TYPE_F32);
-            auto * k_rot = is_swa ? inp_attn->self_k_rot_swa : inp_attn->self_k_rot;
-            auto * v_rot = is_swa ? inp_attn->self_v_rot_swa : inp_attn->self_v_rot;
+            auto * k_rot = is_swa ? inp_attn->self_k_rot_swa[il] : inp_attn->self_k_rot[il];
+            auto * v_rot = is_swa ? inp_attn->self_v_rot_swa[il] : inp_attn->self_v_rot[il];
 
             if (k_rot) {
                 q = llama_mul_mat_hadamard(ctx0, q, k_rot);
@@ -458,7 +460,7 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
 
             ggml_tensor * rel_fa = ggml_reshape_4d(ctx0, rel,
                     rel_extent, n_head, n_tokens/n_stream, n_stream);
-            ggml_tensor * mask = is_swa ? inp_attn->get_kq_mask_swa() : inp_attn->get_kq_mask();
+            ggml_tensor * mask = is_swa ? inp_attn->self_attn_mask_swa.raw : inp_attn->self_attn_mask.raw;
             mask = ggml_cont(ctx0, ggml_view_4d(ctx0, mask,
                     n_kv_flash, mask->ne[1], mask->ne[2], mask->ne[3],
                     mask->nb[1], mask->nb[2], mask->nb[3], 0));
