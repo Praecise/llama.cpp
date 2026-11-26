@@ -29,9 +29,12 @@
 #define CU_MEM_LOCATION_TYPE_DEVICE hipMemLocationTypeDevice
 #define CU_MEM_ACCESS_FLAGS_PROT_READWRITE hipMemAccessFlagsProtReadWrite
 #define CU_CHECK(fn) {hipError_t err = fn; if(err != hipSuccess) { GGML_ABORT("HipVMM Failure: %s\n", hipGetErrorString(err)); }}
-#define __shfl_sync(mask, var, laneMask, width) __shfl(var, laneMask, width)
-#define __shfl_up_sync(mask, var, laneMask, width) __shfl_up(var, laneMask, width)
-#define __shfl_xor_sync(mask, var, laneMask, width) __shfl_xor(var, laneMask, width)
+// The CUDA shuffles take the width last and default it to the warp size; the HIP ones do the same,
+// so the width stays optional here (norm.cu calls __shfl_xor_sync with three arguments, and ROCm 7
+// declares its own __shfl_xor_sync with a defaulted width that a four-argument macro would shadow).
+#define __shfl_sync(mask, var, laneMask, ...) __shfl(var, laneMask, ##__VA_ARGS__)
+#define __shfl_up_sync(mask, var, laneMask, ...) __shfl_up(var, laneMask, ##__VA_ARGS__)
+#define __shfl_xor_sync(mask, var, laneMask, ...) __shfl_xor(var, laneMask, ##__VA_ARGS__)
 #define __all_sync(mask, var) __all(var)
 #define __any_sync(mask, var) __any(var)
 #define cublasStrsmBatched hipblasStrsmBatched
