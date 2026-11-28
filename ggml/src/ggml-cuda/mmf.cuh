@@ -98,17 +98,9 @@ static __global__ void mul_mat_f(
     const int sample_x    = sample_dst / sample_ratio;
     const int sample_y    = sample_dst;
 
-    x   += int64_t(sample_x)  *stride_sample_x   + int64_t(channel_x)*stride_channel_x + int64_t(row0)*stride_row;
-    y   += int64_t(sample_y)  *stride_sample_y   + (has_ids ? 0 : int64_t(channel_y)  *stride_channel_y);
-    dst += int64_t(sample_dst)*stride_sample_dst + (has_ids ? 0 : int64_t(channel_dst)*stride_channel_dst);
-
-    if constexpr (has_ids) {
-        constexpr int y_stride_scale = std::is_same_v<T, float> ? 1 : 2;
-        const int64_t col_offset = col_base;
-        y   += col_offset * stride_col_y * y_stride_scale;
-        dst += col_offset * stride_col_dst;
-        ids += col_offset * stride_row_id;
-    }
+    x   += int64_t(sample_x)  *stride_sample_x   + int64_t(channel_x)  *stride_channel_x  + int64_t(row0)*stride_row;
+    y   += int64_t(sample_y)  *stride_sample_y   + int64_t(channel_y)  *stride_channel_y;
+    dst += int64_t(sample_dst)*stride_sample_dst + int64_t(channel_dst)*stride_channel_dst;
 
     [[maybe_unused]] const float2 * y2 = (const float2 *) y;
 
