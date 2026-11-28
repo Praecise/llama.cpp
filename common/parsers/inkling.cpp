@@ -1,118 +1,163 @@
 #include "parsers.h"
 
-// Inkling / TML typed-content-block parser: <|end_message|> separates blocks within a turn,
-// <|content_model_end_sampling|> is the sole end-of-generation token (mirrors sglang TmlDetector).
+bool is_inkling_template(const std::string & src) {
+    return src.find("<|message_user|>") != std::string::npos &&
+           src.find("<|content_image|>") != std::string::npos;
+}
+
+// the template makes one message block per content part, but a media marker comes inside the text of a message
+// <header><|content_text|>{media}text<|end_message|> --> <header>{media}<|end_message|><header><|content_text|>text<|end_message|>
+static void inkling_split_media(common_chat_prompt & prompt) {
+    const std::string TEXT      = "<|content_text|>";
+    const std::string END       = "<|end_message|>";
+    const std::string MEDIA_BEG = "<__media_";
+    const std::string MEDIA_END = "__>";
+
+    std::vector<common_chat_prompt_part> out;
+    for (size_t i = 0; i < prompt.parts.size(); i++) {
+        const auto & part = prompt.parts[i];
+        const bool in_text_block = part.is_input && part.text.find(MEDIA_BEG) != std::string::npos &&
+            !out.empty() && !out.back().is_input && string_ends_with(out.back().text, TEXT) &&
+            i + 1 < prompt.parts.size() && !prompt.parts[i + 1].is_input && string_starts_with(prompt.parts[i + 1].text, END);
+        const size_t header_pos = in_text_block ? out.back().text.rfind("<|message_") : std::string::npos;
+        if (header_pos == std::string::npos) {
+            out.push_back(part);
+            continue;
+        }
+        const std::string header = out.back().text.substr(header_pos, out.back().text.size() - TEXT.size() - header_pos);
+
+        std::string rest = part.text;
+        for (bool first = true; !rest.empty(); first = false) {
+            const size_t beg      = rest.find(MEDIA_BEG);
+            const size_t end      = beg == std::string::npos ? beg : rest.find(MEDIA_END, beg);
+            const bool   is_media = beg == 0 && end != std::string::npos;
+            const size_t len      = is_media ? end + MEDIA_END.size() : (end == std::string::npos ? rest.size() : beg);
+            if (!first) {
+                out.push_back({ END + header + (is_media ? "" : TEXT), false });
+            } else if (is_media) {
+                // mtmd opens the media block
+                out.back().text.resize(out.back().text.size() - TEXT.size());
+            }
+            out.push_back({ rest.substr(0, len), true });
+            rest.erase(0, len);
+        }
+    }
+    prompt.parts = std::move(out);
+}
+
+// Inkling 1 and 2 - the assistant turn is a list of blocks, all closed by <|end_message|>:
+//   <|message_model|><|content_thinking|>...<|end_message|>
+//   <|message_model|><|content_text|>...<|end_message|>
+//   <|message_model|>NAME<|content_invoke_tool_json|>{"name":"NAME","args":{...}}<|end_message|>
 common_chat_params common_chat_params_init_inkling(const common_chat_template &          tmpl,
-                                                          const autoparser::generation_params & inputs) {
+                                                   const autoparser::generation_params & inputs) {
     common_chat_params data;
 
-    const std::string MSG_MODEL    = "<|message_model|>";
-    const std::string MSG_USER     = "<|message_user|>";
-    const std::string MSG_SYSTEM   = "<|message_system|>";
-    const std::string MSG_TOOL     = "<|message_tool|>";
-    const std::string THINK        = "<|content_thinking|>";
-    const std::string TEXT         = "<|content_text|>";
-    const std::string END_MESSAGE  = "<|end_message|>";
-    const std::string END_SAMPLING = "<|content_model_end_sampling|>";
-    const std::string INVOKE_TOOL  = "<|content_invoke_tool_json|>";
+    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
+    data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+    data.supports_thinking = true;
 
-    data.prompt             = common_chat_template_direct_apply_impl(tmpl, inputs);
-    data.generation_prompt  = common_chat_template_generation_prompt_impl(tmpl, inputs);
-    data.format             = COMMON_CHAT_FORMAT_PEG_NATIVE;
-    data.supports_thinking  = true;
+    inkling_split_media(data.prompt);
+
+    const std::string HEADER    = "<|message_model|>";
+    const std::string THINK     = "<|content_thinking|>";
+    const std::string TEXT      = "<|content_text|>";
+    const std::string TOOL_JSON = "<|content_invoke_tool_json|>";
+    const std::string END       = "<|end_message|>";
+
+    data.preserved_tokens = { HEADER, THINK, TEXT, TOOL_JSON, END };
+
     data.thinking_start_tag = THINK;
-    data.thinking_end_tags  = {END_MESSAGE};
-    data.preserved_tokens   = {
-        MSG_MODEL, MSG_USER, MSG_SYSTEM, MSG_TOOL,
-        THINK, TEXT, END_MESSAGE, END_SAMPLING, INVOKE_TOOL,
-    };
+    data.thinking_end_tags  = { END };
 
-    auto has_tools = inputs.tools.is_array() && !inputs.tools.empty();
     data.message_delimiters = {
-        { COMMON_CHAT_ROLE_ASSISTANT, MSG_MODEL },
-        { COMMON_CHAT_ROLE_USER,      MSG_USER },
-        { COMMON_CHAT_ROLE_SYSTEM,    MSG_SYSTEM },
-        { COMMON_CHAT_ROLE_TOOL,      MSG_TOOL },
+        { COMMON_CHAT_ROLE_ASSISTANT, HEADER               },
+        { COMMON_CHAT_ROLE_USER,      "<|message_user|>"   },
+        { COMMON_CHAT_ROLE_SYSTEM,    "<|message_system|>" },
+        { COMMON_CHAT_ROLE_TOOL,      "<|message_tool|>"   },
     };
-
-    auto extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
 
     if (inputs.has_continuation()) {
         const auto & msg = inputs.continue_msg;
 
-        data.generation_prompt = MSG_MODEL + THINK + msg.reasoning_content;
+        data.generation_prompt.clear();
+        if (!msg.reasoning_content.empty()) {
+            data.generation_prompt = HEADER + THINK + msg.reasoning_content;
+        }
         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
-            data.generation_prompt += END_MESSAGE + TEXT + msg.render_content();
+            if (!data.generation_prompt.empty()) {
+                data.generation_prompt += END;
+            }
+            data.generation_prompt += HEADER + TEXT + msg.render_content();
         }
 
         data.prompt.append(data.generation_prompt);
     }
 
-    data.parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
-        auto generation_prompt = p.literal(MSG_MODEL);
-        auto end               = p.end();
+    auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+    auto has_response_format = !inputs.json_schema.is_null() && inputs.json_schema.is_object();
+    auto use_tools           = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
+    auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
 
-        // thinking block; may also reappear mid-turn (after content), so it is both an optional
-        // prefix and a choice inside the block loops. With reasoning_format=NONE keep it
-        // (markers included) inline as content
-        common_peg_parser reasoning_block = p.eps();
-        if (extract_reasoning) {
-            reasoning_block = p.literal(THINK) +
-                              p.reasoning(p.until_one_of({ END_MESSAGE, TEXT, END_SAMPLING })) +
-                              p.optional(p.literal(END_MESSAGE));
-        } else {
-            reasoning_block = p.content(p.literal(THINK) +
-                                        p.until_one_of({ END_MESSAGE, TEXT, END_SAMPLING }) +
-                                        p.optional(p.literal(END_MESSAGE)));
-        }
-        auto reasoning = p.optional(reasoning_block);
+    data.parser = build_chat_peg_parser(inputs.specials, [&](common_chat_peg_builder & p) {
+        auto header = p.token(HEADER);
+        auto end    = p.token(END);
 
-        // TML re-emits <|message_model|> before each content block; a turn may contain several
-        // text blocks (one per content part), so the block repeats and bodies concatenate.
-        // THINK stops the content scan so a mid-turn thinking block is never leaked as text
-        auto text_block = p.optional(p.literal(MSG_MODEL)) +
-                          p.optional(p.literal(TEXT)) +
-                          p.content(p.until_one_of({ THINK, END_MESSAGE, END_SAMPLING })) +
-                          p.optional(p.literal(END_MESSAGE));
-        auto text_content = p.one_or_more(p.choice({ reasoning_block, text_block }));
+        auto think    = p.token(THINK);
+        auto thinking = p.rule("thinking", extract_reasoning ? think + p.reasoning(p.until(end)) + end :
+                                                               p.atomic(p.content(think)) + p.content(p.until(end) + end));
+        auto text     = p.rule("text", p.token(TEXT) + p.content(p.until(end)) + end);
 
-        if (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
-            return generation_prompt + reasoning + text_content +
-                   p.optional(p.literal(END_SAMPLING)) + end;
+        if (has_response_format) {
+            auto response_format = p.rule("response-format", p.content(p.schema(p.json(), "response-format-schema", inputs.json_schema)));
+            return p.zero_or_more(header + thinking) + header + p.token(TEXT) + response_format + end;
         }
 
-        // each call is its own block (role opener + bare name echo + JSON section);
-        // force_tool_calls=true makes the JSON section required so a pure-text answer fails the
-        // block cleanly; parallel calls are separate blocks, hence repeat + parallel=false
-        auto tool_section = p.standard_json_tools(
-            INVOKE_TOOL, END_MESSAGE, inputs.tools, /* parallel_tool_calls = */ false,
-            /* force_tool_calls = */ true,
-            /* name_key          = */ "name",
-            /* args_key          = */ "args",
-            /* array_wrapped     = */ false,
-            /* function_is_key   = */ false,
-            /* call_id_key       = */ "",
-            /* gen_call_id_key   = */ "",
-            /* parameters_order  = */ {},
-            /* accept_openai_wrapper = */ false,
-            /* require_object_args   = */ true);
-        // the name-echo scan must stop at any block marker: a greedy until(INVOKE_TOOL) returns
-        // NEED_MORE_INPUT mid-stream, which choice() treats as a match and shadows the text branch
-        auto tool_block = p.optional(p.literal(MSG_MODEL)) +
-                          p.until_one_of({ INVOKE_TOOL, TEXT, THINK, END_MESSAGE, END_SAMPLING }) +
-                          tool_section;
-        auto tool_calls = inputs.parallel_tool_calls ? p.one_or_more(tool_block) : tool_block;
-        // turns may interleave narration, thinking and calls; parse block-by-block (tool block
-        // first) since a whole-body choice would let the text branch swallow tool blocks into
-        // visible content
-        auto mixed_body = p.one_or_more(p.choice({ tool_block, reasoning_block, text_block }));
-        auto body       = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED
-                              ? tool_calls
-                              : mixed_body;
+        auto blocks = p.zero_or_more(header + (thinking | text));
 
-        return generation_prompt + reasoning + body +
-               p.optional(p.literal(END_SAMPLING)) + end;
+        if (!use_tools) {
+            return blocks;
+        }
+
+        // the call takes the name in the JSON
+        auto tool_json = p.token(TOOL_JSON);
+        auto tool_body = [&](const common_peg_parser & json_name) {
+            return p.tool_open(p.literal("{")) << p.json_member("name", p.literal("\"") + p.tool_name(json_name) + p.literal("\"")) << p.literal(",")
+                                               << p.json_member("args", p.tool_args(p.json())) << p.tool_close(p.literal("}")) + end;
+        };
+
+        if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
+            auto tool_choice = p.choice();
+            foreach_function(inputs.tools, [&](size_t tool_index, const json & tool) {
+                const auto & function = tool.at("function");
+                std::string  name     = function.at("name");
+                std::string  quoted   = json(name).dump();
+
+                // The research model does not generate a tool name before the tool call token
+                auto json_name = p.literal(quoted.substr(1, quoted.size() - 2));
+                tool_choice |= p.rule("tool-" + std::to_string(tool_index), p.tool(p.optional(p.literal(name)) + tool_json + tool_body(json_name)));
+            });
+
+            auto calls = inputs.parallel_tool_calls ? tool_choice + p.zero_or_more(header + tool_choice) : tool_choice;
+            return blocks + header + calls;
+        }
+
+        auto name  = p.until(tool_json);
+        auto body  = tool_body(p.string_content('"'));
+        auto next  = p.rule("tool-call", header + p.tool(name + tool_json + body));
+        auto more  = inputs.parallel_tool_calls ? p.zero_or_more(next) : p.eps();
+        auto calls = header + name + p.trigger_rule("tool-calls", tool_json, body + more);
+
+        return blocks + p.optional(calls);
     });
+
+    if (has_response_format || use_tools) {
+        data.grammar_lazy = false;
+        data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+            data.parser.build_grammar(builder, !has_response_format && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO);
+        });
+    }
 
     return data;
 }

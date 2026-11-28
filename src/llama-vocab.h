@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <string>
+#include <string_view>
 #include <vector>
 #include <memory>
 
@@ -74,8 +75,10 @@ enum llama_vocab_pre_type {
     LLAMA_VOCAB_PRE_TYPE_DOMYN_SMALL       = 63,
     LLAMA_VOCAB_PRE_TYPE_NEMOTRON_3_5_EMBD = 64,
     LLAMA_VOCAB_PRE_TYPE_SOPRANO           = 65,
-    LLAMA_VOCAB_PRE_TYPE_TEKKEN_NUM3       = 67,
-    LLAMA_VOCAB_PRE_TYPE_INKLING           = 66,
+    LLAMA_VOCAB_PRE_TYPE_TEKKEN_NUM3       = 66,
+    LLAMA_VOCAB_PRE_TYPE_ZONOS3            = 67,
+    LLAMA_VOCAB_PRE_TYPE_RAON              = 68,
+    LLAMA_VOCAB_PRE_TYPE_INKLING           = 69,
 };
 
 // HF Metaspace pre-tokenizer prepend_scheme
@@ -168,13 +171,14 @@ struct llama_vocab {
     bool get_remove_extra_whitespaces  () const;
     bool get_escape_whitespaces        () const;
     bool get_treat_whitespace_as_suffix() const;
+    enum llama_metaspace_prepend_scheme get_metaspace_prepend_scheme() const;
     const normalizer_options & get_normalizer_opts() const;
 
     const std::vector<llama_token> & get_suppress_tokens() const;
 
     int max_token_len() const;
 
-    int find_bpe_rank(const std::string & token_left, const std::string & token_right) const;
+    int find_bpe_rank(std::string_view token_left, std::string_view token_right) const;
     std::vector<std::string> get_bpe_merges() const;
 
     std::vector<char> get_precompiled_charsmap() const;
