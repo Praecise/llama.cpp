@@ -125,6 +125,16 @@ static bool match_string(const std::string & input, llama_grammar * grammar) {
             return false;
         }
 
+        // the fork's accept degrades to an unconstrained turn instead of throwing across the C ABI,
+        // and leaves no stacks: that is a rejection too
+        if (stacks_cur.empty()) {
+            if (allowed) {
+                fprintf(stderr, "❌ (token %d \"%s\" is allowed by the mask but not accepted)\n", in.token, in.piece.c_str());
+            }
+            assert(!allowed);
+            return false;
+        }
+
         if (!allowed) {
             fprintf(stderr, "❌ (token %d \"%s\" is masked but accepted)\n", in.token, in.piece.c_str());
         }
